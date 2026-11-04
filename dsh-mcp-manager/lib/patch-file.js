@@ -7,7 +7,12 @@
  * without a restart.
  *
  * The file is user-owned and full of prose comments, so this module never
- * re-serializes it. It owns exactly one delimited block:
+ * re-serializes it. It owns exactly one delimited block, and that block has two
+ * shapes, because the row can be mounted two ways:
+ *
+ * **`insert`** — this plugin was installed as loose files under the profile and
+ * *this block is what puts the row into the tree*. The block must therefore
+ * create the row:
  *
  *   # >>> dsh-mcp-manager managed block ... >>>
  *   - insert:
@@ -18,11 +23,18 @@
  *             - {"name":"echo","transport":"stdio",...}
  *   # <<< dsh-mcp-manager managed block <<<
  *
- * The row lives inside an `insert` list because that is how the loader's patch
- * algorithm adds an entry — a bare `- id:` patch only retargets a row that
- * already exists. The loader also anchors a relative `name` beside the patch
- * file, so `./plugins/dsh-mcp-manager/lib/index.js` resolves to this package
- * without touching the profile's `node_modules`.
+ * **`override`** — the row already exists because an installed bundle layer
+ * inserts it (the documented `dsh.bundle` distribution). Repeating the row here
+ * would mount it twice, so the block only retargets the existing row by id and
+ * replaces its `config` (the loader replaces the whole config value, it does not
+ * deep-merge keys):
+ *
+ *   # >>> dsh-mcp-manager managed block ... >>>
+ *   - id: mcp-manager
+ *     config:
+ *       servers:
+ *         - {"name":"echo","transport":"stdio",...}
+ *   # <<< dsh-mcp-manager managed block <<<
  *
  * Each server is one JSON object on its own line. JSON is valid YAML, so the
  * loader parses it natively, and one-object-per-line keeps the managed block
@@ -46,6 +58,8 @@ export const DEFAULT_ROW_NAME = './plugins/dsh-mcp-manager/lib/index.js'
 export const PATCH_FILENAME = 'cordis.patch.yml'
 /** Root composition filename inside a profile directory. */
 const ROOT_CONFIG_FILENAME = 'cordis.yml'
+/** How the managed block claims the row: create it, or retarget it. */
+export const MANAGED_MODES = Object.freeze({ insert: 'insert', override: 'override' })
 
 /**
  * Locate the profile's user patch layer.
@@ -92,15 +106,18 @@ function toLines(text) {
 /**
  * Read the managed block out of a patch file's text.
  * @param text - patch file content (possibly `''` or `undefined`).
- * @returns whether the block exists plus its parsed servers and row options.
+ * @returns whether the block exists plus its mode, parsed servers, and row options.
  */
 export function readManagedBlock(text) {
   const lines = toLines(typeof text === 'string' ? text : '')
   const start = lines.findIndex((line) => line.includes(BLOCK_START))
-  if (start === -1) return { found: false, servers: [], rowName: DEFAULT_ROW_NAME, patchFile: '' }
+  if (start === -1) {
+    return { found: false, mode: MANAGED_MODES.insert, servers: [], rowName: DEFAULT_ROW_NAME, patchFile: '' }
+  }
   const end = lines.findIndex((line, index) => index > start && line.includes(BLOCK_END))
   const body = lines.slice(start + 1, end === -1 ? lines.length : end)
-  const nameLine = body.find((line) => /^\s*name:/.test(line))
+  const mode = body.some((line) => /^\s*-\s+insert:\s*$/.test(line)) ? MANAGED_MODES.insert : MANAGED_MODES.override
+  const nameLine = body.find((line) => /^\s{4,}name:/.test(line))
   const rowName = nameLine === undefined
     ? DEFAULT_ROW_NAME
     : nameLine.replace(/^\s*name:\s*/, '').trim().replace(/^['"]|['"]$/g, '')
@@ -109,10 +126,10 @@ export function readManagedBlock(text) {
     ? ''
     : patchLine.replace(/^\s*patchFile:\s*/, '').trim().replace(/^['"]|['"]$/g, '')
   const serversIndex = body.findIndex((line) => /^\s*servers:/.test(line))
-  if (serversIndex === -1) return { found: true, servers: [], rowName, patchFile }
+  if (serversIndex === -1) return { found: true, mode, servers: [], rowName, patchFile }
   const inline = body[serversIndex].replace(/^\s*servers:\s*/, '').trim()
   if (inline !== '') {
-    if (inline === '[]') return { found: true, servers: [], rowName, patchFile }
+    if (inline === '[]') return { found: true, mode, servers: [], rowName, patchFile }
     throw new Error(`dsh-mcp-manager：受管区块里的 servers 值无法识别：${inline}`)
   }
   const servers = []
@@ -123,32 +140,33 @@ export function readManagedBlock(text) {
     if (match === null) break
     servers.push(JSON.parse(match[1]))
   }
-  return { found: true, servers, rowName, patchFile }
+  return { found: true, mode, servers, rowName, patchFile }
 }
 
 /**
  * Render the managed block for one server list.
  * @param servers - normalized server definitions.
- * @param options - row specifier and optional pinned patch path.
+ * @param options - `mode` (`insert` | `override`), row specifier, and optional pinned patch path.
  * @returns the block text, without a trailing newline.
  */
 export function renderManagedBlock(servers, options = {}) {
+  const mode = options.mode === MANAGED_MODES.override ? MANAGED_MODES.override : MANAGED_MODES.insert
   const rowName = options.rowName ?? DEFAULT_ROW_NAME
-  const lines = [
-    BLOCK_START,
-    '- insert:',
-    `    - id: ${ROW_ID}`,
-    `      name: '${rowName}'`,
-    '      config:',
-  ]
+  const lines = [BLOCK_START]
+  if (mode === MANAGED_MODES.insert) {
+    lines.push('- insert:', `    - id: ${ROW_ID}`, `      name: '${rowName}'`, '      config:')
+  } else {
+    lines.push(`- id: ${ROW_ID}`, '  config:')
+  }
+  const configIndent = mode === MANAGED_MODES.insert ? '        ' : '    '
   if (typeof options.patchFile === 'string' && options.patchFile !== '') {
-    lines.push(`        patchFile: '${options.patchFile.replaceAll('\\', '/')}'`)
+    lines.push(`${configIndent}patchFile: '${options.patchFile.replaceAll('\\', '/')}'`)
   }
   if (servers.length === 0) {
-    lines.push('        servers: []')
+    lines.push(`${configIndent}servers: []`)
   } else {
-    lines.push('        servers:')
-    for (const server of servers) lines.push(`          - ${JSON.stringify(server)}`)
+    lines.push(`${configIndent}servers:`)
+    for (const server of servers) lines.push(`${configIndent}  - ${JSON.stringify(server)}`)
   }
   lines.push(BLOCK_END)
   return lines.join('\n')
@@ -202,7 +220,7 @@ function appendManagedBlock(source, lines, block) {
     const index = lines.findIndex((line) => line.trim() === '[]')
     return [...lines.slice(0, index), ...toLines(block), ...lines.slice(index + 1)].join('\n')
   }
-  if (meaningful.length > 0 && !/^\s*-/.test(meaningful[meaningful.length - 1])) {
+  if (meaningful.length > 0 && !/^\s*-\s/.test(meaningful[0])) {
     throw new Error('拒绝写入：patch 层不是顶层 patch 条目列表')
   }
   const head = source.trimEnd()
@@ -231,7 +249,7 @@ export function readManagedRowName(file) {
 
 /**
  * Initialize a missing patch file with the stock header comment.
- * @param file - absolute patch-file path.
+ * @param file - absolute patch file path.
  * @returns file content to use when the file does not exist.
  */
 function missingFileContent(file) {
@@ -242,24 +260,28 @@ function missingFileContent(file) {
  * Persist one server list into the managed block.
  *
  * The write is verified before it lands: the generated document is re-read and
- * its server list compared with the intended one, so a bug in rendering can
- * never overwrite the user's patch layer with something that does not round-trip.
- * The file is replaced by rename, which the profile's chokidar-based watcher
- * reports as an ordinary change.
+ * its mode and server list compared with the intent, so a bug in rendering can
+ * never overwrite the user's patch layer with something that does not
+ * round-trip. The file is replaced by rename, which the profile's chokidar-based
+ * watcher reports as an ordinary change.
  *
  * @param file - absolute path of the profile's `cordis.patch.yml`.
  * @param servers - normalized server definitions to persist.
- * @param options - row options (`rowName`, `patchFile`).
+ * @param options - `mode`, row specifier (insert mode only), and pinned patch path.
  * @returns the absolute path written.
  */
 export function writeManagedServers(file, servers, options = {}) {
   if (typeof file !== 'string' || file === '') throw new Error('dsh-mcp-manager：没有可写入的 patch 文件；请在行配置里设置 patchFile')
   const before = existsSync(file) ? readFileSync(file, 'utf8') : missingFileContent(file)
-  const next = upsertManagedBlock(before, renderManagedBlock(servers, options))
+  const block = renderManagedBlock(servers, options)
+  const next = upsertManagedBlock(before, block)
   const verified = readManagedBlock(next)
-  const expected = JSON.stringify(servers)
-  const actual = JSON.stringify(verified.servers)
-  if (actual !== expected) throw new Error('dsh-mcp-manager：受管区块无法往返解析，拒绝写入（以免损坏 patch 层）')
+  if (JSON.stringify(verified.servers) !== JSON.stringify(servers)) {
+    throw new Error('dsh-mcp-manager：受管区块无法往返解析，拒绝写入（以免损坏 patch 层）')
+  }
+  if (verified.mode !== (options.mode === MANAGED_MODES.override ? MANAGED_MODES.override : MANAGED_MODES.insert)) {
+    throw new Error('dsh-mcp-manager：受管区块的模式无法往返解析，拒绝写入（以免重复挂载该行）')
+  }
   const temporary = `${file}.dsh-mcp-manager.tmp`
   writeFileSync(temporary, next, 'utf8')
   renameSync(temporary, file)

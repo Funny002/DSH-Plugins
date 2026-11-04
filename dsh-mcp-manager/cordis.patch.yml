@@ -1,0 +1,16 @@
+# dsh-mcp-manager bundle layer.
+#
+# This layer ships with the package: it inserts the one manager row, so
+# `dsh plugin --profile <name> add <this package>` is the whole installation.
+# The row's `servers` list is owned by the settings page, which writes a
+# separate id-targeted block into the profile's own cordis.patch.yml — the later
+# layer wins, and the loader replaces the whole `config` value rather than
+# deep-merging keys.
+#
+# The row name is the package name, not a path: the profile's pnpm-installed
+# `node_modules` is what Node resolves it through.
+- insert:
+    - id: mcp-manager
+      name: dsh-mcp-manager
+      config:
+        servers: []

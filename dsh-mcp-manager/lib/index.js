@@ -20,14 +20,33 @@
  * closing every MCP connection and unregistering every bridged tool — and the
  * replacement reconnects from the freshly patched config.
  *
+ * The managed block adapts to how the row was mounted: when this plugin's own
+ * `dsh.bundle` layer put the row in the tree (the `dsh plugin add` install), the
+ * block only retargets the existing row by id; when the row exists because the
+ * block itself inserted it (a loose copy under the profile), the block keeps
+ * creating it. See `./patch-file.js`.
+ *
  * @module dsh-mcp-manager
  */
 import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { fileURLToPath } from 'node:url'
 import { serveChannelRequest } from './channel.js'
 import { errorMessage, isRecord } from './naming.js'
-import { DEFAULT_ROW_NAME, ROW_ID, discoverPatchFile, readManagedRowName, writeManagedServers } from './patch-file.js'
-import { DEFAULT_TOOL_CALL_TIMEOUT_MS, McpServerSupervisor, probeServer } from './supervisor.js'
+import {
+  DEFAULT_ROW_NAME,
+  ROW_ID,
+  discoverPatchFile,
+  readManagedRowName,
+  writeManagedServers,
+} from './patch-file.js'
+import {
+  DEFAULT_TOOL_CALL_TIMEOUT_MS,
+  McpServerSupervisor,
+  RECONNECT_DEFAULTS,
+  probeServer,
+  resolveReconnectPolicy,
+} from './supervisor.js'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'mcp-manager'
@@ -39,6 +58,20 @@ export const CHANNEL = '/mcp-manager'
 const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
 /** Shortest usable numeric config value. */
 const MIN_TIMEOUT_MS = 1
+/** This module's own path, used to tell "our block inserted the row" from "a bundle did". */
+const SELF_MODULE_PATH = fileURLToPath(import.meta.url)
+
+/**
+ * Reconnect policy for one server. Every bound is re-validated by
+ * {@link resolveReconnectPolicy} so a hand-written patch entry cannot smuggle in
+ * a zero-delay retry storm.
+ */
+const ReconnectSchema = z.object({
+  enabled: z.boolean().default(RECONNECT_DEFAULTS.enabled),
+  initialDelayMs: z.number().default(RECONNECT_DEFAULTS.initialDelayMs),
+  maxDelayMs: z.number().default(RECONNECT_DEFAULTS.maxDelayMs),
+  maxAttempts: z.number().default(RECONNECT_DEFAULTS.maxAttempts),
+})
 
 const StdioServerSchema = z.object({
   name: z.string().required().pattern(SERVER_NAME_PATTERN),
@@ -49,6 +82,7 @@ const StdioServerSchema = z.object({
   env: z.dict(String).default({}),
   cwd: z.string().default(''),
   toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
+  reconnect: ReconnectSchema,
 })
 
 const StreamableHttpServerSchema = z.object({
@@ -58,6 +92,7 @@ const StreamableHttpServerSchema = z.object({
   url: z.string().required(),
   headers: z.dict(String).default({}),
   toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
+  reconnect: ReconnectSchema,
 })
 
 /** One managed MCP server, discriminated on `transport`. */
@@ -100,6 +135,32 @@ function toStringMap(value) {
 }
 
 /**
+ * Normalize one reconnect policy from untrusted input.
+ *
+ * Unknown keys are dropped here (the write path must produce exactly what the
+ * schema accepts), while out-of-range values are kept and rejected by
+ * {@link resolveReconnectPolicy} when the supervisor is built — so a bad policy
+ * fails loudly instead of being silently corrected.
+ * @param input - untrusted `reconnect` value.
+ * @returns the normalized policy object.
+ */
+export function normalizeReconnect(input) {
+  const source = isRecord(input) ? input : {}
+  const number = (key) => {
+    const raw = source[key]
+    if (raw === undefined || raw === null) return RECONNECT_DEFAULTS[key]
+    const value = Number(raw)
+    return Number.isFinite(value) ? value : RECONNECT_DEFAULTS[key]
+  }
+  return {
+    enabled: source.enabled === undefined ? RECONNECT_DEFAULTS.enabled : source.enabled !== false,
+    initialDelayMs: number('initialDelayMs'),
+    maxDelayMs: number('maxDelayMs'),
+    maxAttempts: number('maxAttempts'),
+  }
+}
+
+/**
  * Validate and normalize one server definition.
  *
  * Unknown fields are dropped, so what the settings page writes back is exactly
@@ -118,6 +179,7 @@ export function normalizeServer(input) {
     ? Math.max(MIN_TIMEOUT_MS, Math.trunc(Number(input.toolCallTimeoutMs)))
     : DEFAULT_TOOL_CALL_TIMEOUT_MS
   const enabled = input.enabled !== false
+  const reconnect = normalizeReconnect(input.reconnect)
   if (input.transport === 'streamable-http') {
     let url = String(input.url ?? '').trim()
     if (url === '') throw new Error(`服务器 "${serverName}"：streamable-http 必须填写地址（url）`)
@@ -136,6 +198,7 @@ export function normalizeServer(input) {
       url,
       headers: toStringMap(input.headers),
       toolCallTimeoutMs: timeout,
+      reconnect,
     }
   }
   if (input.transport !== 'stdio') {
@@ -152,6 +215,7 @@ export function normalizeServer(input) {
     env: toStringMap(input.env),
     cwd: String(input.cwd ?? ''),
     toolCallTimeoutMs: timeout,
+    reconnect,
   }
 }
 
@@ -165,6 +229,41 @@ function assertUniqueNames(servers) {
     if (seen.has(server.name)) throw new Error(`服务器 "${server.name}" 已存在：名称必须唯一`)
     seen.add(server.name)
   }
+}
+
+/**
+ * Decide how the managed block must address this row.
+ *
+ * `insert` means the block is what mounts the row (a loose copy under the
+ * profile). `override` means some other layer already mounts it — in practice
+ * this plugin's own `dsh.bundle` patch, installed with `dsh plugin add` — so
+ * repeating the row would mount it twice and the block may only retarget it.
+ *
+ * The test is the composed loader entry's own specifier: when it resolves to
+ * *this* module, the row came from the block; anything else (a bare package
+ * specifier, another path) came from a different layer.
+ *
+ * @param ctx - host plugin context carrying the Loader service.
+ * @returns the mode the next write must use.
+ */
+export function resolveManagedMode(ctx) {
+  const loader = ctx.get('loader')
+  if (loader === undefined || typeof loader.entries !== 'function') return 'insert'
+  for (const entry of loader.entries()) {
+    const options = entry.options ?? {}
+    if (options.id !== ROW_ID) continue
+    const specifier = options.name
+    if (typeof specifier !== 'string') continue
+    if (!specifier.startsWith('file:')) return 'override'
+    let path
+    try {
+      path = fileURLToPath(specifier)
+    } catch {
+      continue
+    }
+    return path.toLowerCase() === SELF_MODULE_PATH.toLowerCase() ? 'insert' : 'override'
+  }
+  return 'insert'
 }
 
 /**
@@ -188,6 +287,8 @@ export class McpManager extends Service {
   patchFile
   /** @type {string} explicit `patchFile` from the row config, kept when writing the block back. */
   patchFilePinned
+  /** @type {'insert'|'override'} how the managed block addresses this row. */
+  managedMode
   /**
    * Registration state of the browser RPC channel. It is reported in every
    * snapshot so the settings page (and a host-side probe) can tell "the plugin
@@ -205,21 +306,28 @@ export class McpManager extends Service {
     super(ctx, 'mcpManager')
     this.definitions = (config.servers ?? []).map((server) => normalizeServer(server))
     assertUniqueNames(this.definitions)
+    // Fail the row here rather than starting a server with a broken policy.
+    for (const definition of this.definitions) {
+      resolveReconnectPolicy(definition.reconnect, `mcp-manager(${definition.name}): reconnect`)
+    }
     this.patchFilePinned = config.patchFile === undefined ? '' : String(config.patchFile)
     this.patchFile = this.patchFilePinned === '' ? discoverPatchFile(ctx) : this.patchFilePinned
+    this.managedMode = resolveManagedMode(ctx)
     this.generation = Date.now()
     for (const definition of this.definitions) this.adoptServer(definition)
     this.ctx.logger.info(
-      'mcp-manager: %d server(s) configured, %d enabled, patch layer %s',
+      'mcp-manager: %d server(s) configured, %d enabled, patch layer %s (%s mode)',
       this.definitions.length,
       this.definitions.filter((server) => server.enabled !== false).length,
       this.patchFile === '' ? '(not found — persistence disabled)' : this.patchFile,
+      this.managedMode,
     )
   }
 
   /** Create a supervisor for one definition and start it unless disabled. */
   adoptServer(definition) {
-    const supervisor = new McpServerSupervisor(this.ctx, definition)
+    const policy = resolveReconnectPolicy(definition.reconnect, `mcp-manager(${definition.name}): reconnect`)
+    const supervisor = new McpServerSupervisor(this.ctx, definition, policy)
     this.supervisors.set(definition.name, supervisor)
     if (definition.enabled !== false) void supervisor.start()
   }
@@ -232,20 +340,31 @@ export class McpManager extends Service {
     const servers = [...this.supervisors.values()].map((supervisor) => {
       const status = supervisor.status()
       if (status.enabled) return status
-      return { ...status, state: 'disabled', error: '', toolCount: 0, tools: [], startedAt: 0, lastSyncAt: 0 }
+      return {
+        ...status,
+        state: 'disabled',
+        error: '',
+        toolCount: 0,
+        tools: [],
+        startedAt: 0,
+        lastSyncAt: 0,
+        reconnect: { ...status.reconnect, attempts: 0, nextRetryAt: 0 },
+      }
     })
     servers.sort((left, right) => left.name.localeCompare(right.name))
     return {
       generation: this.generation,
       rowId: ROW_ID,
+      patchMode: this.managedMode,
       channel: { ...this.channel },
       patchFile: this.patchFile,
-      persistence: { writable: this.patchFile !== '', patchFile: this.patchFile },
+      persistence: { writable: this.patchFile !== '', patchFile: this.patchFile, mode: this.managedMode },
       servers,
       totals: {
         servers: servers.length,
         enabled: this.definitions.filter((definition) => definition.enabled !== false).length,
         connected: servers.filter((server) => server.state === 'connected').length,
+        reconnecting: servers.filter((server) => server.state === 'reconnecting').length,
         tools: servers.reduce((total, server) => total + server.toolCount, 0),
       },
     }
@@ -282,8 +401,13 @@ export class McpManager extends Service {
         '无法持久化：没有找到 profile 的 patch 文件。请在 mcp-manager 行的 config 里显式设置 patchFile，或在 profile 目录中运行本插件。',
       )
     }
+    // Re-read how the row is mounted rather than trusting the value cached at
+    // activation: writing `insert` for a row a bundle already provides would
+    // mount it twice on the next launch.
+    this.managedMode = resolveManagedMode(this.ctx)
     writeManagedServers(this.patchFile, next, {
-      rowName: readManagedRowName(this.patchFile),
+      mode: this.managedMode,
+      rowName: this.managedMode === 'insert' ? readManagedRowName(this.patchFile) : DEFAULT_ROW_NAME,
       patchFile: this.patchFilePinned,
     })
     this.definitions = next
@@ -292,6 +416,7 @@ export class McpManager extends Service {
     return {
       persisted: true,
       patchFile: this.patchFile,
+      mode: this.managedMode,
       generation: this.generation,
       reloading: true,
       snapshot: this.list(),
@@ -371,6 +496,10 @@ export class McpManager extends Service {
 
   /**
    * Re-fetch tool lists without touching the definition set.
+   *
+   * On a server that is down this also revives it: the supervisor starts a
+   * fresh connection, which is how the settings page pulls a server out of
+   * "gave up reconnecting" without a config change.
    * @param serverName - optional single server.
    * @returns the refreshed snapshot.
    */

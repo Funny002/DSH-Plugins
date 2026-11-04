@@ -1,8 +1,8 @@
 {
   "name": "dsh-mcp-manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "MCP server manager: a Host half that connects stdio/Streamable-HTTP MCP servers and registers their tools on ctx.tools, plus a browser settings page that edits, starts, and stops them through the profile's cordis.patch.yml.",
+  "description": "MCP server manager: a Host half that supervises stdio/Streamable-HTTP MCP servers with reconnect and registers their tools on ctx.tools, plus a browser settings page that edits, starts, and stops them through the profile's cordis.patch.yml.",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -15,6 +15,9 @@
     "./package.json": "./package.json"
   },
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": [
@@ -28,11 +31,16 @@
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/schemastery": "^3.18.2"
   },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/schemastery": "3.18.2"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "zod": "^4.0.0"
   },
   "files": [
+    "cordis.patch.yml",
     "lib/index.js",
     "lib/channel.js",
     "lib/client.js",

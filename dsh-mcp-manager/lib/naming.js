@@ -12,6 +12,12 @@
  *
  * The raw MCP name is the only name ever sent on the wire.
  *
+ * Content projection mirrors the shipped bridge as well: text stays text, an
+ * image block either becomes a durable image attachment (when the active model
+ * route declares image input and the attachment store admits it) or an explicit
+ * diagnostic, and every other MCP block becomes a bounded placeholder instead of
+ * an unbounded dump.
+ *
  * @module dsh-mcp-manager/naming
  */
 import { createHash } from 'node:crypto'
@@ -22,6 +28,10 @@ const MAX_PUBLIC_NAME_LENGTH = 64
 const INVALID_NAME_CHARS = /[^A-Za-z0-9_-]/g
 /** Hex characters of the identity hash appended on lossy normalization. */
 const HASH_LENGTH = 12
+/** Media types the durable attachment store admits. */
+export const IMAGE_MEDIA_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+/** Canonical RFC 4648 base64: no whitespace, no URL-safe aliases. */
+const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
 
 /**
  * Derive the model-facing public name for one MCP tool.
@@ -47,42 +57,104 @@ export function isRecord(value) {
 }
 
 /**
- * Project one MCP content block to model-visible text.
- *
- * Text passes through, images become a bounded placeholder (this bridge does not
- * persist attachments), resource links keep their name and URI as text, and every
- * other block is rendered as compact JSON so nothing is silently dropped.
- * @param block - one untrusted MCP content block.
- * @returns the text projection of that block.
+ * Whether a declared MIME string is one the attachment store persists.
+ * @param value - candidate media type.
+ * @returns true for PNG, JPEG, WebP, or GIF.
  */
-export function blockToText(block) {
-  if (!isRecord(block)) return typeof block === 'string' ? block : JSON.stringify(block)
-  switch (block.type) {
-    case 'text':
-      return typeof block.text === 'string' ? block.text : ''
-    case 'image':
-      return `[image ${typeof block.mimeType === 'string' ? block.mimeType : 'unknown type'}]`
-    case 'audio':
-      return `[audio ${typeof block.mimeType === 'string' ? block.mimeType : 'unknown type'}]`
-    case 'resource': {
-      const resource = isRecord(block.resource) ? block.resource : {}
-      const uri = typeof resource.uri === 'string' ? resource.uri : '(no uri)'
-      const name = typeof resource.name === 'string' ? resource.name : ''
-      if (typeof resource.text === 'string') return `${name === '' ? '' : `${name} `}${uri}\n${resource.text}`
-      return `[resource ${name === '' ? '' : `${name} `}${uri}]`
-    }
-    case 'resource_link': {
-      const name = typeof block.name === 'string' ? block.name : ''
-      const uri = typeof block.uri === 'string' ? block.uri : '(no uri)'
-      return `[resource_link ${name === '' ? '' : `${name} `}${uri}]`
-    }
-    default:
-      try {
-        return JSON.stringify(block)
-      } catch {
-        return '[unrenderable content block]'
-      }
+function isImageMediaType(value) {
+  return IMAGE_MEDIA_TYPES.includes(value)
+}
+
+/**
+ * Decode one untrusted MCP image block.
+ *
+ * The network is a trust boundary, so both the declared media type and the
+ * payload are re-validated here: only canonical base64 survives, and the round
+ * trip must reproduce the exact input text.
+ * @param block - one MCP content block claiming `type: 'image'`.
+ * @returns the decoded bytes and their media type.
+ * @throws when the media type or the payload is not admissible.
+ */
+export function decodeImageBlock(block) {
+  if (typeof block.mimeType !== 'string' || !isImageMediaType(block.mimeType)) {
+    throw new Error('the declared media type is not PNG, JPEG, WebP, or GIF')
   }
+  if (typeof block.data !== 'string' || !CANONICAL_BASE64.test(block.data)) {
+    throw new Error('the image data is not canonical base64')
+  }
+  const data = Buffer.from(block.data, 'base64')
+  if (data.toString('base64') !== block.data) throw new Error('the image data is not canonical base64')
+  return { data, mediaType: block.mimeType }
+}
+
+/**
+ * Stable diagnostic text for an image block that was not admitted.
+ * @param block - the refused image block.
+ * @param reason - why it was not admitted.
+ * @returns the model-visible placeholder.
+ */
+export function imageDiagnostic(block, reason) {
+  const mediaType = typeof block.mimeType === 'string' ? block.mimeType : 'unknown media type'
+  return `[image unavailable: ${mediaType}; ${reason}; raw image data remains available to programmatic callers]`
+}
+
+/**
+ * Project a whole MCP content array into harness content blocks.
+ *
+ * Text-like runs are newline-coalesced and split at each image position, so an
+ * admitted image keeps its place in the ordered result.
+ * @param content - the MCP result's content array (untrusted).
+ * @param toolName - raw MCP tool name, used for the empty-result placeholder.
+ * @param image - projection for one image block; defaults to a diagnostic.
+ * @returns the projected content blocks, never empty.
+ */
+export function projectContent(content, toolName, image = (block) => ({
+  type: 'text',
+  text: imageDiagnostic(block, 'this result was not admitted to durable model context'),
+})) {
+  const projected = []
+  const text = []
+  const flushText = () => {
+    if (text.length === 0) return
+    projected.push({ type: 'text', text: text.splice(0).join('\n') })
+  }
+  if (!Array.isArray(content)) {
+    return [{ type: 'text', text: `(${toolName} returned no model-visible content)` }]
+  }
+  for (const [index, value] of content.entries()) {
+    if (!isRecord(value)) {
+      text.push('[unsupported MCP content block: expected an object]')
+      continue
+    }
+    switch (value.type) {
+      case 'text':
+        if (typeof value.text === 'string') text.push(value.text)
+        break
+      case 'image':
+        flushText()
+        projected.push(image(value, index))
+        break
+      case 'resource_link':
+        if (typeof value.name !== 'string' || typeof value.uri !== 'string') {
+          text.push('[resource link unavailable: the MCP block is missing its name or URI]')
+        } else {
+          text.push(`Resource link: ${value.name} (${value.uri})`)
+        }
+        break
+      case 'audio':
+        text.push(
+          `[audio result unsupported: ${typeof value.mimeType === 'string' ? value.mimeType : 'unknown media type'}; raw audio data remains available to programmatic callers]`,
+        )
+        break
+      case 'resource':
+        text.push('[embedded resource unsupported; raw resource data remains available to programmatic callers]')
+        break
+      default:
+        text.push(`[unsupported MCP content type: ${String(value.type)}]`)
+    }
+  }
+  flushText()
+  return projected.length > 0 ? projected : [{ type: 'text', text: `(${toolName} returned no model-visible content)` }]
 }
 
 /**
@@ -92,9 +164,9 @@ export function blockToText(block) {
  * @returns the joined text projection.
  */
 export function contentToText(content, rawName) {
-  if (!Array.isArray(content)) return `(${rawName} returned no content)`
-  const parts = content.map(blockToText).filter((part) => part !== '')
-  return parts.length === 0 ? `(${rawName} returned no content)` : parts.join('\n\n')
+  return projectContent(content, rawName)
+    .map((block) => (block.type === 'text' ? block.text : imageDiagnostic(block, 'this result was not admitted to durable model context')))
+    .join('\n')
 }
 
 /**

@@ -32,6 +32,8 @@ window.__ModuleLoader__.load({
     const STYLE_ID = "dsh-mcp-manager-style";
     /** Poll cadence for the status snapshot, in milliseconds. */
     const POLL_MS = 8000;
+    /** How long a persisted-change status notice stays on screen, in milliseconds. */
+    const NOTICE_MS = 4500;
     /** How long a persisted change is watched for its hot-swapped generation. */
     const RELOAD_POLL_MS = 700;
     const RELOAD_POLL_TRIES = 25;
@@ -40,7 +42,7 @@ window.__ModuleLoader__.load({
     const zh = {
       nav: "MCP 服务器",
       title: "MCP 服务器",
-      subtitle: "连接外部 MCP 服务器并把它们的工具注册给模型。所有改动写入 profile 的 cordis.patch.yml 并热生效。",
+      subtitle: "连接外部 MCP 服务器并把它们的工具注册给模型（热生效）。",
       refresh: "刷新",
       add: "添加服务器",
       empty: "还没有配置任何 MCP 服务器。",
@@ -51,7 +53,6 @@ window.__ModuleLoader__.load({
       tools: "工具",
       configFile: "配置文件",
       configMissing: "（未找到）",
-      rowId: "行 id",
       save: "保存",
       cancel: "取消",
       edit: "编辑",
@@ -67,9 +68,42 @@ window.__ModuleLoader__.load({
       status: {
         connected: "已连接",
         connecting: "连接中",
+        reconnecting: "重连中",
         error: "连接失败",
         idle: "未连接",
         disabled: "已禁用",
+      },
+      retrying: "重连",
+      modeOverride: "行由已安装的 bundle 提供（区块按 id 覆盖）",
+      modeInsert: "行由本区块插入",
+      time: {
+        justNow: "刚刚",
+        secondsAgo: "{n} 秒前",
+        minutesAgo: "{n} 分钟前",
+        hoursAgo: "{n} 小时前",
+        daysAgo: "{n} 天前",
+        retryIn: "{s} 秒后重试",
+      },
+      meta: {
+        target: "目标",
+        timeout: "单次调用超时",
+        reconnect: "重连策略",
+        connectedSince: "已连接",
+        lastSync: "最近同步",
+        nextRetry: "下次重试",
+        show: "详情",
+        hide: "隐藏详情",
+      },
+      reconnect: {
+        off: "已关闭",
+        policy: "最多 {attempts} 次 · {from} → {to}",
+      },
+      tool: {
+        copy: "复制",
+        copied: "已复制",
+        search: "筛选工具名或描述",
+        empty: "没有匹配的工具",
+        none: "该服务器还没有公布工具",
       },
       field: {
         name: "名称（工具命名空间）",
@@ -84,6 +118,9 @@ window.__ModuleLoader__.load({
         url: "服务地址（streamable-http）",
         headers: "请求头（每行 KEY: VALUE）",
         timeout: "单次调用超时（毫秒）",
+        reconnect: "断线自动重连",
+        reconnectHint: "连接丢失后按指数退避重连；停机期间工具仍保持列出，只是调用会失败。",
+        reconnectAttempts: "最大重连次数",
       },
       form: {
         addTitle: "添加服务器",
@@ -100,6 +137,7 @@ window.__ModuleLoader__.load({
         removed: "已删除 {name}。",
       },
       error: {
+        label: "最近错误",
         noConnection: "浏览器连接服务不可用。",
         transport: "无法访问宿主插件（可能尚未挂载或正在热重载）",
         unknown: "宿主返回了无法识别的失败。",
@@ -109,8 +147,7 @@ window.__ModuleLoader__.load({
     const en = {
       nav: "MCP servers",
       title: "MCP servers",
-      subtitle:
-        "Connect external MCP servers and give the model their tools. Every change is written to the profile's cordis.patch.yml and hot-applied.",
+      subtitle: "Connect external MCP servers and give the model their tools (hot-applied).",
       refresh: "Refresh",
       add: "Add server",
       empty: "No MCP server is configured yet.",
@@ -121,7 +158,6 @@ window.__ModuleLoader__.load({
       tools: "Tools",
       configFile: "Config file",
       configMissing: "(not found)",
-      rowId: "Row id",
       save: "Save",
       cancel: "Cancel",
       edit: "Edit",
@@ -140,6 +176,39 @@ window.__ModuleLoader__.load({
         error: "Failed",
         idle: "Idle",
         disabled: "Disabled",
+        reconnecting: "Reconnecting",
+      },
+      retrying: "Retrying",
+      modeOverride: "Row came from the installed bundle (block overrides it by id)",
+      modeInsert: "Row is inserted by this block",
+      time: {
+        justNow: "just now",
+        secondsAgo: "{n}s ago",
+        minutesAgo: "{n}m ago",
+        hoursAgo: "{n}h ago",
+        daysAgo: "{n}d ago",
+        retryIn: "retrying in {s}s",
+      },
+      meta: {
+        target: "Target",
+        timeout: "Per-call timeout",
+        reconnect: "Reconnect",
+        connectedSince: "Connected",
+        lastSync: "Last sync",
+        nextRetry: "Next retry",
+        show: "Details",
+        hide: "Hide details",
+      },
+      reconnect: {
+        off: "off",
+        policy: "up to {attempts} · {from} → {to}",
+      },
+      tool: {
+        copy: "Copy",
+        copied: "Copied",
+        search: "Filter by tool name or description",
+        empty: "No matching tool",
+        none: "This server has not advertised any tool",
       },
       field: {
         name: "Name (tool namespace)",
@@ -154,6 +223,9 @@ window.__ModuleLoader__.load({
         url: "Endpoint URL (streamable-http)",
         headers: "Headers (KEY: VALUE per line)",
         timeout: "Per-call timeout (ms)",
+        reconnect: "Reconnect automatically",
+        reconnectHint: "After a drop, retry with exponential backoff. Tools stay listed while the server is down; only calls fail.",
+        reconnectAttempts: "Max reconnect attempts",
       },
       form: {
         addTitle: "Add server",
@@ -170,6 +242,7 @@ window.__ModuleLoader__.load({
         removed: "{name} removed.",
       },
       error: {
+        label: "Last error",
         noConnection: "The browser connection service is unavailable.",
         transport: "Cannot reach the host plugin (not mounted yet, or hot-reloading)",
         unknown: "The host returned an unrecognisable failure.",
@@ -186,6 +259,8 @@ window.__ModuleLoader__.load({
 .dsh-mcp-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .dsh-mcp-summary { display: flex; gap: 12px; flex-wrap: wrap; color: var(--dsw-alias-label-secondary); }
 .dsh-mcp-summary b { color: var(--dsw-alias-label-primary); font-weight: 600; }
+.dsh-mcp-summary-warn { color: var(--dsw-alias-state-warn-primary); }
+.dsh-mcp-summary-warn b { color: var(--dsw-alias-state-warn-primary); }
 .dsh-mcp-spacer { flex: 1 1 auto; }
 .dsh-mcp-btn { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); font: inherit; cursor: pointer; }
 .dsh-mcp-btn:hover { border-color: var(--dsw-alias-brand-primary); }
@@ -198,6 +273,7 @@ window.__ModuleLoader__.load({
 .dsh-mcp-banner.error { border-color: var(--dsw-alias-state-error-primary); color: var(--dsw-alias-state-error-primary); }
 .dsh-mcp-card { display: flex; flex-direction: column; gap: 8px; padding: 12px; border-radius: 8px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1); }
 .dsh-mcp-card-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dsh-mcp-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex: 0 0 auto; }
 .dsh-mcp-name { font-weight: 600; font-size: 14px; }
 .dsh-mcp-chip { padding: 1px 7px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-l2); color: var(--dsw-alias-label-secondary); font-size: 11px; }
 .dsh-mcp-state { display: inline-flex; align-items: center; gap: 6px; color: var(--dsw-alias-label-secondary); }
@@ -205,12 +281,28 @@ window.__ModuleLoader__.load({
 .dsh-mcp-dot.connected { background: var(--dsw-alias-state-success-primary); }
 .dsh-mcp-dot.connecting { background: var(--dsw-alias-state-warn-primary); }
 .dsh-mcp-dot.error { background: var(--dsw-alias-state-error-primary); }
-.dsh-mcp-target { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--dsw-alias-label-secondary); overflow-wrap: anywhere; }
-.dsh-mcp-error { color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; }
-.dsh-mcp-tools { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.dsh-mcp-line { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; color: var(--dsw-alias-label-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dsh-mcp-toolbar { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.dsh-mcp-error { color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; max-height: 40px; overflow: hidden; }
+.dsh-mcp-error-label { margin-right: 6px; font-weight: 600; }
+.dsh-mcp-tools { margin: 0; padding: 0 4px 0 0; list-style: none; display: flex; flex-direction: column; gap: 6px; max-height: 340px; overflow: auto; }
 .dsh-mcp-tools li { display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; border-radius: 6px; background: var(--dsw-alias-bg-layer-2); }
 .dsh-mcp-tools code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 .dsh-mcp-tools span { color: var(--dsw-alias-label-secondary); }
+.dsh-mcp-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 6px 16px; }
+.dsh-mcp-meta-item { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.dsh-mcp-meta-item > label { color: var(--dsw-alias-label-secondary); font-size: 11px; }
+.dsh-mcp-meta-item > span, .dsh-mcp-meta-item > code { overflow-wrap: anywhere; }
+.dsh-mcp-meta-item > code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.dsh-mcp-tools-panel { display: flex; flex-direction: column; gap: 6px; }
+.dsh-mcp-tools-search { width: 100%; box-sizing: border-box; padding: 4px 8px; border-radius: 6px; font: inherit; border: 1px solid var(--dsw-alias-border-l2); background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary); }
+.dsh-mcp-tools-search:focus { outline: none; border-color: var(--dsw-alias-brand-primary); }
+.dsh-mcp-tool-head { display: flex; align-items: center; gap: 8px; }
+.dsh-mcp-tool-raw { font-size: 11px; }
+.dsh-mcp-tool-desc { color: var(--dsw-alias-label-secondary); }
+.dsh-mcp-tools-empty { color: var(--dsw-alias-label-secondary); }
+.dsh-mcp-copy { padding: 1px 6px; font-size: 11px; }
+.dsh-mcp-chip.warn { color: var(--dsw-alias-state-warn-primary); border-color: currentColor; }
 .dsh-mcp-form { display: flex; flex-direction: column; gap: 10px; padding: 12px; border-radius: 8px; border: 1px solid var(--dsw-alias-brand-primary); background: var(--dsw-alias-bg-layer-1); }
 .dsh-mcp-fields { display: flex; flex-direction: column; gap: 10px; }
 .dsh-mcp-field { display: flex; flex-direction: column; gap: 4px; }
@@ -279,6 +371,89 @@ window.__ModuleLoader__.load({
       return String(text).replace(/\{(\w+)\}/g, (match, key) => (key in values ? String(values[key]) : match));
     }
 
+    /**
+     * Short, locale-neutral duration used by the meta grid: `800ms`, `1.5s`, `30s`, `2m`.
+     * @param value - milliseconds.
+     * @returns the formatted duration.
+     */
+    function formatDuration(value) {
+      const ms = Number(value);
+      if (!Number.isFinite(ms) || ms <= 0) return "0ms";
+      if (ms < 1000) return `${String(Math.round(ms))}ms`;
+      const seconds = ms / 1000;
+      // Keep seconds up to two minutes: a 60s call timeout reads better than "1m".
+      if (seconds < 120) return `${Number.isInteger(seconds) ? String(seconds) : seconds.toFixed(1)}s`;
+      return `${String(Math.round(seconds / 60))}m`;
+    }
+
+    /**
+     * One-line summary of a server's reconnect policy.
+     * @param t - translator.
+     * @param reconnect - the server's `reconnect` status block.
+     * @returns the summary text.
+     */
+    function formatReconnectPolicy(t, reconnect) {
+      const policy = reconnect === undefined || reconnect === null ? {} : reconnect;
+      if (policy.enabled === false) return t("reconnect.off");
+      return fill(t("reconnect.policy"), {
+        attempts: policy.maxAttempts ?? 10,
+        from: formatDuration(policy.initialDelayMs ?? 500),
+        to: formatDuration(policy.maxDelayMs ?? 30000),
+      });
+    }
+
+    /**
+     * Relative "how long ago" text for a timestamp.
+     * @param t - translator.
+     * @param from - epoch milliseconds; `0`/absent yields an empty string.
+     * @param now - the page's current clock.
+     * @returns the relative time, or `""` when there is nothing to show.
+     */
+    function formatAgo(t, from, now) {
+      const then = Number(from);
+      if (!Number.isFinite(then) || then <= 0) return "";
+      const seconds = Math.max(0, Math.round((Number(now) - then) / 1000));
+      if (seconds < 5) return t("time.justNow");
+      if (seconds < 60) return fill(t("time.secondsAgo"), { n: seconds });
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return fill(t("time.minutesAgo"), { n: minutes });
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return fill(t("time.hoursAgo"), { n: hours });
+      return fill(t("time.daysAgo"), { n: Math.floor(hours / 24) });
+    }
+
+    /**
+     * Countdown text for a scheduled retry.
+     * @param t - translator.
+     * @param nextRetryAt - epoch milliseconds of the retry; `0` yields an empty string.
+     * @param now - the page's current clock.
+     * @returns the countdown text.
+     */
+    function formatRetryIn(t, nextRetryAt, now) {
+      const target = Number(nextRetryAt);
+      if (!Number.isFinite(target) || target <= 0) return "";
+      const remaining = Math.max(0, (target - Number(now)) / 1000);
+      return fill(t("time.retryIn"), { s: remaining.toFixed(1) });
+    }
+
+    /**
+     * Case-insensitive tool filter over the public name, the raw MCP name, and the description.
+     * @param tools - the server's tool rows.
+     * @param query - what the user typed.
+     * @returns the matching rows (all rows for an empty query).
+     */
+    function filterTools(tools, query) {
+      const list = Array.isArray(tools) ? tools : [];
+      const needle = String(query ?? "").trim().toLowerCase();
+      if (needle === "") return list;
+      return list.filter((tool) => {
+        const publicName = String(tool.publicName ?? "").toLowerCase();
+        const rawName = String(tool.rawName ?? "").toLowerCase();
+        const description = String(tool.description ?? "").toLowerCase();
+        return publicName.includes(needle) || rawName.includes(needle) || description.includes(needle);
+      });
+    }
+
     /** Split a textarea into trimmed, non-empty lines. */
     function lines(text) {
       return String(text ?? "")
@@ -319,6 +494,10 @@ window.__ModuleLoader__.load({
         url: "",
         headersText: "",
         timeout: "60000",
+        reconnect: true,
+        reconnectAttempts: "10",
+        reconnectInitialMs: "500",
+        reconnectMaxMs: "30000",
       };
     }
 
@@ -336,7 +515,18 @@ window.__ModuleLoader__.load({
       draft.url = String(definition.url ?? "");
       draft.headersText = mapToLines(definition.headers);
       draft.timeout = String(definition.toolCallTimeoutMs ?? 60000);
+      const reconnect = definition.reconnect === undefined || definition.reconnect === null ? {} : definition.reconnect;
+      draft.reconnect = reconnect.enabled !== false;
+      draft.reconnectAttempts = String(reconnect.maxAttempts ?? 10);
+      draft.reconnectInitialMs = String(reconnect.initialDelayMs ?? 500);
+      draft.reconnectMaxMs = String(reconnect.maxDelayMs ?? 30000);
       return draft;
+    }
+
+    /** Read one positive integer draft field, falling back when it is not usable. */
+    function positiveInteger(value, fallback) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 1 ? Math.trunc(parsed) : fallback;
     }
 
     /** Build the RPC definition payload from draft values. */
@@ -347,6 +537,12 @@ window.__ModuleLoader__.load({
         enabled: draft.enabled !== false,
         transport: draft.transport,
         toolCallTimeoutMs: Number.isFinite(timeout) && timeout > 0 ? Math.trunc(timeout) : 60000,
+        reconnect: {
+          enabled: draft.reconnect !== false,
+          initialDelayMs: positiveInteger(draft.reconnectInitialMs, 500),
+          maxDelayMs: positiveInteger(draft.reconnectMaxMs, 30000),
+          maxAttempts: positiveInteger(draft.reconnectAttempts, 10),
+        },
       };
       if (draft.transport === "streamable-http") {
         return { ...base, url: draft.url.trim(), headers: linesToMap(draft.headersText) };
@@ -395,6 +591,7 @@ window.__ModuleLoader__.load({
       if (server.enabled === false) return "disabled";
       if (server.state === "connected") return "connected";
       if (server.state === "connecting") return "connecting";
+      if (server.state === "reconnecting") return "reconnecting";
       if (server.state === "error") return "error";
       return "idle";
     }
@@ -423,10 +620,35 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** One server card: identity, live state, and its actions. */
+    /**
+     * One server card.
+     *
+     * Progressive disclosure: the default card is the identity line plus a
+     * one-line target, so a long server list stays scannable. `详情` reveals the
+     * policy/timing grid, and `工具列表 (n)` reveals the tools — each independently,
+     * and both remembered by the section so a status poll does not collapse them.
+     */
     function ServerCard(props) {
-      const { server, t, busy, expanded, onToggle, onEdit, onRemove, onRefresh, onToggleDetails } = props;
-      const key = statusKey(server);
+      const { server, t, busy, metaOpen, toolsOpen, now, onToggle, onEdit, onRemove, onRefresh, onToggleMeta, onToggleTools } =
+        props;
+      const [query, setQuery] = useState("");
+      const [copied, setCopied] = useState("");
+      const reconnect = server.reconnect === undefined || server.reconnect === null ? {} : server.reconnect;
+      const tools = server.tools ?? [];
+      const visible = filterTools(tools, query);
+      const clock = typeof now === "number" ? now : Date.now();
+      const metaItem = (labelKey, value) =>
+        h("span", { className: "dsh-mcp-meta-item" }, h("label", null, t(labelKey)), value);
+      const copyName = (name) => {
+        const clipboard = typeof navigator === "undefined" ? undefined : navigator.clipboard;
+        if (clipboard === undefined || clipboard === null) return;
+        void Promise.resolve(clipboard.writeText(name))
+          .then(() => {
+            setCopied(name);
+            if (typeof setTimeout === "function") setTimeout(() => setCopied(""), 1200);
+          })
+          .catch(() => {});
+      };
       return h(
         "div",
         { className: "dsh-mcp-card" },
@@ -436,74 +658,157 @@ window.__ModuleLoader__.load({
           h("span", { className: "dsh-mcp-name" }, server.name),
           h("span", { className: "dsh-mcp-chip" }, server.transport),
           h(StateBadge, { server, t }),
-          h("span", { className: "dsh-mcp-chip" }, `${t("tools")} ${String(server.toolCount)}`),
-          h("span", { className: "dsh-mcp-spacer" }),
+          server.state === "reconnecting"
+            ? h(
+                "span",
+                { className: "dsh-mcp-chip warn" },
+                [
+                  `${String(reconnect.attempts ?? 0)}/${String(reconnect.maxAttempts ?? 0)}`,
+                  formatRetryIn(t, reconnect.nextRetryAt, clock),
+                ]
+                  .filter((part) => part !== "")
+                  .join(" · "),
+              )
+            : null,
           h(
-            "button",
-            {
-              type: "button",
-              className: "dsh-mcp-btn",
-              disabled: busy !== "",
-              onClick: () => onToggle(server),
-            },
-            server.enabled === false ? t("start") : t("stop"),
+            "span",
+            { className: "dsh-mcp-actions" },
+            h(
+              "button",
+              {
+                type: "button",
+                className: "dsh-mcp-btn",
+                disabled: busy !== "",
+                onClick: () => onToggle(server),
+              },
+              server.enabled === false ? t("start") : t("stop"),
+            ),
+            h(
+              "button",
+              {
+                type: "button",
+                className: "dsh-mcp-btn",
+                disabled: busy !== "",
+                onClick: () => onEdit(server),
+              },
+              t("edit"),
+            ),
+            h(
+              "button",
+              {
+                type: "button",
+                className: "dsh-mcp-btn ghost",
+                disabled: busy !== "",
+                onClick: () => onRefresh(server),
+              },
+              t("refresh"),
+            ),
+            h(
+              "button",
+              {
+                type: "button",
+                className: "dsh-mcp-btn danger",
+                disabled: busy !== "",
+                onClick: () => onRemove(server),
+              },
+              t("remove"),
+            ),
           ),
+        ),
+        metaOpen
+          ? h(
+              "div",
+              { className: "dsh-mcp-meta" },
+              metaItem("meta.target", h("code", null, server.target)),
+              metaItem("meta.timeout", formatDuration(server.timeoutMs ?? 60000)),
+              metaItem("meta.reconnect", formatReconnectPolicy(t, reconnect)),
+              server.state === "connected" ? metaItem("meta.connectedSince", formatAgo(t, server.startedAt, clock)) : null,
+              server.state === "connected" ? metaItem("meta.lastSync", formatAgo(t, server.lastSyncAt, clock)) : null,
+              server.state === "reconnecting" && reconnect.nextRetryAt
+                ? metaItem("meta.nextRetry", formatRetryIn(t, reconnect.nextRetryAt, clock))
+                : null,
+            )
+          : h("div", { className: "dsh-mcp-line", title: server.target }, server.target),
+        server.error === "" || server.error === undefined
+          ? null
+          : h(
+              "div",
+              { className: "dsh-mcp-error", title: server.error },
+              h("span", { className: "dsh-mcp-error-label" }, t("error.label")),
+              server.error,
+            ),
+        h(
+          "div",
+          { className: "dsh-mcp-toolbar" },
           h(
             "button",
             {
               type: "button",
-              className: "dsh-mcp-btn",
-              disabled: busy !== "",
-              onClick: () => onEdit(server),
+              className: "dsh-mcp-btn ghost",
+              "aria-expanded": metaOpen === true,
+              onClick: () => onToggleMeta(server.name),
             },
-            t("edit"),
+            metaOpen ? t("meta.hide") : t("meta.show"),
           ),
           h(
             "button",
             {
               type: "button",
               className: "dsh-mcp-btn ghost",
-              disabled: busy !== "",
-              onClick: () => onRefresh(server),
+              "aria-expanded": toolsOpen === true,
+              onClick: () => onToggleTools(server.name),
             },
-            t("refresh"),
-          ),
-          h(
-            "button",
-            {
-              type: "button",
-              className: "dsh-mcp-btn danger",
-              disabled: busy !== "",
-              onClick: () => onRemove(server),
-            },
-            t("remove"),
+            toolsOpen ? t("hideDetails") : `${t("details")} (${String(server.toolCount)})`,
           ),
         ),
-        h("div", { className: "dsh-mcp-target" }, server.target),
-        server.error === "" || server.error === undefined ? null : h("div", { className: "dsh-mcp-error" }, server.error),
-        server.toolCount === 0
-          ? null
-          : h(
-              "div",
-              null,
-              h(
-                "button",
-                { type: "button", className: "dsh-mcp-btn ghost", onClick: () => onToggleDetails(server.name) },
-                expanded ? t("hideDetails") : `${t("details")} (${String(server.toolCount)})`,
-              ),
-            ),
-        expanded
+        toolsOpen
           ? h(
-              "ul",
-              { className: "dsh-mcp-tools" },
-              (server.tools ?? []).map((tool) =>
-                h(
-                  "li",
-                  { key: tool.publicName },
-                  h("code", null, tool.publicName),
-                  h("span", null, tool.description === "" ? tool.rawName : tool.description),
-                ),
-              ),
+              "div",
+              { className: "dsh-mcp-tools-panel" },
+              tools.length > 6
+                ? h("input", {
+                    type: "search",
+                    className: "dsh-mcp-tools-search",
+                    placeholder: t("tool.search"),
+                    value: query,
+                    onChange: (event) => setQuery(event.target.value),
+                  })
+                : null,
+              tools.length === 0
+                ? h("div", { className: "dsh-mcp-tools-empty" }, t("tool.none"))
+                : visible.length === 0
+                  ? h("div", { className: "dsh-mcp-tools-empty" }, t("tool.empty"))
+                  : h(
+                      "ul",
+                      { className: "dsh-mcp-tools" },
+                      visible.map((tool) =>
+                        h(
+                          "li",
+                          { key: tool.publicName },
+                          h(
+                            "div",
+                            { className: "dsh-mcp-tool-head" },
+                            h("code", null, tool.publicName),
+                            tool.rawName === tool.publicName
+                              ? null
+                              : h("span", { className: "dsh-mcp-tool-raw" }, tool.rawName),
+                            h("span", { className: "dsh-mcp-spacer" }),
+                            h(
+                              "button",
+                              {
+                                type: "button",
+                                className: "dsh-mcp-btn ghost dsh-mcp-copy",
+                                onClick: () => copyName(tool.publicName),
+                              },
+                              copied === tool.publicName ? t("tool.copied") : t("tool.copy"),
+                            ),
+                          ),
+                          tool.description === ""
+                            ? null
+                            : h("span", { className: "dsh-mcp-tool-desc" }, tool.description),
+                        ),
+                      ),
+                    ),
             )
           : null,
       );
@@ -613,6 +918,22 @@ window.__ModuleLoader__.load({
           { label: t("field.timeout") },
           h("input", { ...input("timeout"), type: "number", min: "1", step: "1000" }),
         ),
+        h(
+          Field,
+          { label: t("field.reconnect"), hint: t("field.reconnectHint") },
+          h("input", {
+            type: "checkbox",
+            checked: draft.reconnect !== false,
+            onChange: (event) => update({ reconnect: event.target.checked }),
+          }),
+        ),
+        draft.reconnect === false
+          ? null
+          : h(
+              Field,
+              { label: t("field.reconnectAttempts") },
+              h("input", { ...input("reconnectAttempts"), type: "number", min: "1", step: "1" }),
+            ),
         probe === null
           ? null
           : h(
@@ -645,14 +966,52 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = useState("");
       const [busy, setBusy] = useState("");
       const [editing, setEditing] = useState(null);
-      const [expanded, setExpanded] = useState("");
+      const [toolsOpen, setToolsOpen] = useState("");
+      const [metaOpen, setMetaOpen] = useState("");
       const reloadTimer = useRef(null);
       const generationRef = useRef(0);
+      const noticeTimer = useRef(null);
+      /** Page clock for relative times; advances with each poll and each retry countdown tick. */
+      const [clock, setClock] = useState(() => Date.now());
+
+      /** Clear the status notice and cancel its pending dismissal. */
+      const dismissNotice = useCallback(() => {
+        if (noticeTimer.current !== null) {
+          clearTimeout(noticeTimer.current);
+          noticeTimer.current = null;
+        }
+        setNotice("");
+      }, []);
+
+      /**
+       * Show one status notice and schedule its own dismissal.
+       *
+       * A confirmation is only useful while the action is fresh: without this the
+       * banner from the last save stayed on screen until the next mutation.
+       */
+      const showNotice = useCallback((message) => {
+        if (noticeTimer.current !== null) clearTimeout(noticeTimer.current);
+        setNotice(message);
+        noticeTimer.current = typeof setTimeout === "function"
+          ? setTimeout(() => {
+              noticeTimer.current = null;
+              setNotice("");
+            }, NOTICE_MS)
+          : null;
+      }, []);
+
+      useEffect(
+        () => () => {
+          if (noticeTimer.current !== null) clearTimeout(noticeTimer.current);
+        },
+        [],
+      );
 
       const load = useCallback(async () => {
         try {
           const next = await call("state", {});
           setSnapshot(next);
+          setClock(Date.now());
           generationRef.current = next.generation;
           setError("");
           return next;
@@ -693,7 +1052,7 @@ window.__ModuleLoader__.load({
               setError("");
               if (next.generation !== generationRef.current) {
                 generationRef.current = next.generation;
-                setNotice(t("notice.reloaded"));
+                showNotice(t("notice.reloaded"));
               }
             })
             .catch(() => {
@@ -702,19 +1061,19 @@ window.__ModuleLoader__.load({
             });
         };
         reloadTimer.current = setTimeout(tick, RELOAD_POLL_MS);
-      }, [call, t]);
+      }, [call, showNotice, t]);
 
       const mutate = useCallback(
         (endpoint, payload, message) => {
           setBusy(endpoint);
           setError("");
-          setNotice("");
+          dismissNotice();
           return Promise.resolve()
             .then(() => call(endpoint, payload))
             .then((value) => {
               if (value && value.snapshot) setSnapshot(value.snapshot);
               if (value && typeof value.generation === "number") generationRef.current = value.generation;
-              setNotice(message);
+              showNotice(message);
               settleAfterSave();
               return value;
             })
@@ -723,7 +1082,7 @@ window.__ModuleLoader__.load({
             })
             .finally(() => setBusy(""));
         },
-        [call, settleAfterSave],
+        [call, dismissNotice, settleAfterSave, showNotice],
       );
 
       const onToggle = useCallback(
@@ -750,17 +1109,17 @@ window.__ModuleLoader__.load({
         (server) => {
           setBusy("refresh");
           setError("");
-          setNotice("");
+          dismissNotice();
           void Promise.resolve()
             .then(() => call("refresh", server === undefined ? {} : { name: server.name }))
             .then((next) => {
               if (next && Array.isArray(next.servers)) setSnapshot(next);
-              setNotice(t("notice.refreshed"));
+              showNotice(t("notice.refreshed"));
             })
             .catch((failure) => setError(String((failure && failure.message) || failure)))
             .finally(() => setBusy(""));
         },
-        [call, t],
+        [call, dismissNotice, showNotice, t],
       );
 
       const onSubmitDraft = useCallback(
@@ -775,7 +1134,16 @@ window.__ModuleLoader__.load({
       const onProbeDraft = useCallback((definition) => call("probe", { definition }), [call]);
 
       const servers = snapshot === null ? [] : snapshot.servers ?? [];
-      const totals = snapshot === null ? { servers: 0, enabled: 0, connected: 0, tools: 0 } : snapshot.totals ?? {};
+      const totals = snapshot === null ? { servers: 0, enabled: 0, connected: 0, reconnecting: 0, tools: 0 } : snapshot.totals ?? {};
+      const reconnecting = servers.filter((server) => server.state === "reconnecting").length;
+
+      // Tick once a second only while a server is counting down to its retry;
+      // otherwise the status poll already refreshes every relative time.
+      useEffect(() => {
+        if (reconnecting === 0) return undefined;
+        const timer = setInterval(() => setClock(Date.now()), 1000);
+        return () => clearInterval(timer);
+      }, [reconnecting]);
 
       return h(
         "div",
@@ -795,6 +1163,9 @@ window.__ModuleLoader__.load({
             h("span", null, t("servers"), " ", h("b", null, String(totals.servers ?? 0))),
             h("span", null, t("enabled"), " ", h("b", null, String(totals.enabled ?? 0))),
             h("span", null, t("connected"), " ", h("b", null, String(totals.connected ?? 0))),
+            reconnecting === 0
+              ? null
+              : h("span", { className: "dsh-mcp-summary-warn" }, t("retrying"), " ", h("b", null, String(reconnecting))),
             h("span", null, t("tools"), " ", h("b", null, String(totals.tools ?? 0))),
           ),
           h("span", { className: "dsh-mcp-spacer" }),
@@ -815,7 +1186,7 @@ window.__ModuleLoader__.load({
               className: "dsh-mcp-btn primary",
               disabled: busy !== "" || editing !== null,
               onClick: () => {
-                setNotice("");
+                dismissNotice();
                 setEditing({ server: null });
               },
             },
@@ -846,15 +1217,18 @@ window.__ModuleLoader__.load({
                 server,
                 t,
                 busy,
-                expanded: expanded === server.name,
+                now: clock,
+                metaOpen: metaOpen === server.name,
+                toolsOpen: toolsOpen === server.name,
                 onToggle,
                 onRemove,
                 onRefresh,
                 onEdit: (target) => {
-                  setNotice("");
+                  dismissNotice();
                   setEditing({ server: target });
                 },
-                onToggleDetails: (name) => setExpanded((current) => (current === name ? "" : name)),
+                onToggleMeta: (name) => setMetaOpen((current) => (current === name ? "" : name)),
+                onToggleTools: (name) => setToolsOpen((current) => (current === name ? "" : name)),
               }),
             ),
         snapshot === null
@@ -862,8 +1236,16 @@ window.__ModuleLoader__.load({
           : h(
               "div",
               { className: "dsh-mcp-footer" },
-              h("span", null, t("configFile"), ": ", h("code", null, snapshot.patchFile === "" ? t("configMissing") : snapshot.patchFile)),
-              h("span", null, t("rowId"), ": ", h("code", null, snapshot.rowId ?? "mcp-manager")),
+              h(
+                "span",
+                {
+                  className: "dsh-mcp-footer-line",
+                  title: snapshot.patchMode === "override" ? t("modeOverride") : t("modeInsert"),
+                },
+                t("configFile"),
+                ": ",
+                h("code", null, snapshot.patchFile === "" ? t("configMissing") : snapshot.patchFile),
+              ),
             ),
       );
     }
@@ -929,7 +1311,19 @@ window.__ModuleLoader__.load({
     /** Offline authoring surface: `test/check-client.mjs` renders these without a browser. */
     exports.__components = { McpServersSection, ServerCard, ServerForm, StateBadge };
     /** Pure helpers the offline check asserts directly. */
-    exports.__helpers = { saveAction, definitionFromDraft, draftFromDefinition, draftProblem, statusKey };
+    exports.__helpers = {
+      saveAction,
+      definitionFromDraft,
+      draftFromDefinition,
+      draftProblem,
+      statusKey,
+      filterTools,
+      formatAgo,
+      formatDuration,
+      formatReconnectPolicy,
+      formatRetryIn,
+      positiveInteger,
+    };
     exports.__dictionaries = { zh, en };
     return module.exports;
   },
