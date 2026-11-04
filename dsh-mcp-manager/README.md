@@ -103,6 +103,7 @@ config:
 
 - 一个 lazy-CJS factory 产物，通过 `window.__ModuleLoader__.load({ id: 'dsh-mcp-manager', factory })` 注册，只 `require('react')`（平台基线模块），因此不需要构建步骤。
 - 在 `settings.section` 注册 id 为 `mcp-servers` 的设置页（order 25）。**展示要点**：
+  - 标题右侧是**版本徽标**（`v0.2.0`）：版本号由宿主从本包 `package.json` 读取后随 `state` 快照下发，因此页面上显示的永远是实际加载的那份代码的版本；读不到时（或旧宿主）不渲染徽标，而不是显示一个假的 `v`。
   - 顶部汇总：服务器 / 已启用 / 已连接 / 工具数，有服务器正在重连时额外显示「重连 n」。
   - 每张卡片头部：名称、传输方式、状态徽标；重连中额外显示「2/5 · 1.8 秒后重试」，并按秒倒计时（只在有服务器重连时启用 1 秒 tick，其余时间跟随 8 秒状态轮询）。操作按钮成组靠右，窄面板下整组换行而不是从中间断开。
   - **默认折叠，按需展开**：卡片只显示身份行、单行目标（超长省略）、错误（若有）和一行入口「详情 / 工具列表 (n)」，把每张卡片的阅读量压到 3 行左右。两个入口互相独立，展开状态由设置页记住，状态轮询不会把它们收起来。
@@ -119,7 +120,7 @@ config:
 
 | endpoint | 载荷 | 返回 |
 | --- | --- | --- |
-| `state` | `{}` | `{ generation, rowId, patchMode, channel, patchFile, persistence, servers[], totals }` |
+| `state` | `{}` | `{ generation, version, rowId, patchMode, channel, patchFile, persistence, servers[], totals }` |
 | `add` | `{ definition }` | 写入回执 + `snapshot` |
 | `update` | `{ name, definition }` | 写入回执 + `snapshot`（改 `definition.name` 即重命名） |
 | `remove` | `{ name }` | 写入回执 + `snapshot` |

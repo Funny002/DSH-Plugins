@@ -30,6 +30,7 @@
  */
 import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { serveChannelRequest } from './channel.js'
 import { errorMessage, isRecord } from './naming.js'
@@ -54,12 +55,33 @@ export const name = 'mcp-manager'
 export const inject = ['tools']
 /** Absolute RPC channel the browser settings page calls. */
 export const CHANNEL = '/mcp-manager'
+/**
+ * The installed package version, read from this package's own `package.json` so
+ * the settings page can show a single version identity. A missing or unreadable
+ * manifest must not fail the row: the badge is diagnostic, not functional.
+ */
+export const VERSION = readPackageVersion()
 /** Valid server namespace, kept inside the public tool-name budget. */
 const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
 /** Shortest usable numeric config value. */
 const MIN_TIMEOUT_MS = 1
 /** This module's own path, used to tell "our block inserted the row" from "a bundle did". */
 const SELF_MODULE_PATH = fileURLToPath(import.meta.url)
+/** Shown when the manifest cannot be read; never a valid published version. */
+const UNKNOWN_VERSION = '0.0.0'
+
+/**
+ * Read `version` from the package manifest beside this module.
+ * @returns the declared version, or `0.0.0` when it cannot be read.
+ */
+function readPackageVersion() {
+  try {
+    const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+    return typeof manifest.version === 'string' && manifest.version !== '' ? manifest.version : UNKNOWN_VERSION
+  } catch {
+    return UNKNOWN_VERSION
+  }
+}
 
 /**
  * Reconnect policy for one server. Every bound is re-validated by
@@ -354,6 +376,7 @@ export class McpManager extends Service {
     servers.sort((left, right) => left.name.localeCompare(right.name))
     return {
       generation: this.generation,
+      version: VERSION,
       rowId: ROW_ID,
       patchMode: this.managedMode,
       channel: { ...this.channel },

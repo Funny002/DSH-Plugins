@@ -16,7 +16,7 @@ const check = (label, condition, detail = '') => {
   failures.push(`${label}${detail === '' ? '' : `: ${detail}`}`)
 }
 
-const { Config, normalizeReconnect, normalizeServer, inject, name: pluginName } = await import(lib('index.js'))
+const { Config, VERSION, normalizeReconnect, normalizeServer, inject, name: pluginName } = await import(lib('index.js'))
 const naming = await import(lib('naming.js'))
 const patchFile = await import(lib('patch-file.js'))
 const supervisor = await import(lib('supervisor.js'))
@@ -24,6 +24,9 @@ const supervisor = await import(lib('supervisor.js'))
 // ── plugin identity ──────────────────────────────────────────────────────────
 check('plugin name', pluginName === 'mcp-manager')
 check('static inject is tools only', JSON.stringify(inject) === '["tools"]')
+const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+check('version comes from the package manifest', VERSION === manifest.version, `${VERSION} vs ${manifest.version}`)
+check('version is a semver triple', /^\d+\.\d+\.\d+/.test(VERSION), VERSION)
 
 // ── config schema ────────────────────────────────────────────────────────────
 const resolved = Config({

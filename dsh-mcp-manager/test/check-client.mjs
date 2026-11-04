@@ -142,6 +142,7 @@ const strictT = (key) => {
 
 const snapshot = {
   generation: 1,
+  version: '0.2.0',
   rowId: 'mcp-manager',
   channel: { path: '/mcp-manager', state: 'registered', error: '' },
   patchFile: 'C:/Users/x/.dsh/profiles/web/cordis.patch.yml',
@@ -471,6 +472,20 @@ function findElement(node, predicate) {
     text,
   )
   check('the loaded page summarises the live state', text.includes('重连'), text)
+  check('the page identifies its version', text.includes('v0.2.0'), text)
+}
+
+{
+  // An older host (or the very first poll) has no version; the badge must not
+  // render a bare "v".
+  const legacy = createMount(McpServersSection, {
+    call: async () => ({ ...snapshot, version: undefined }),
+    t: strictT,
+    close: () => {},
+  })
+  const text = collectText(await legacy.settle()).join(' | ')
+  check('an unversioned host renders no badge', !text.includes('v0.2.0') && !/ \| v \| /.test(text), text)
+  check('the page still renders without a version', text.includes('MCP 服务器'), text)
 }
 
 // ── a status notice dismisses itself ───────────────────────────────────────

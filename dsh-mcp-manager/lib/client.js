@@ -43,6 +43,7 @@ window.__ModuleLoader__.load({
       nav: "MCP 服务器",
       title: "MCP 服务器",
       subtitle: "连接外部 MCP 服务器并把它们的工具注册给模型（热生效）。",
+      versionHint: "插件版本",
       refresh: "刷新",
       add: "添加服务器",
       empty: "还没有配置任何 MCP 服务器。",
@@ -148,6 +149,7 @@ window.__ModuleLoader__.load({
       nav: "MCP servers",
       title: "MCP servers",
       subtitle: "Connect external MCP servers and give the model their tools (hot-applied).",
+      versionHint: "Plugin version",
       refresh: "Refresh",
       add: "Add server",
       empty: "No MCP server is configured yet.",
@@ -254,7 +256,9 @@ window.__ModuleLoader__.load({
     const CSS = `
 .dsh-mcp { display: flex; flex-direction: column; gap: 14px; max-width: 860px; font-size: 13px; line-height: 1.5; color: var(--dsw-alias-label-primary); }
 .dsh-mcp-head { display: flex; flex-direction: column; gap: 6px; }
+.dsh-mcp-title-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .dsh-mcp-title { margin: 0; font-size: 15px; font-weight: 600; }
+.dsh-mcp-version { padding: 0 6px; border: 1px solid var(--dsw-alias-border-l2); border-radius: 999px; color: var(--dsw-alias-label-secondary); font-size: 11px; font-variant-numeric: tabular-nums; letter-spacing: .02em; }
 .dsh-mcp-subtitle { margin: 0; color: var(--dsw-alias-label-secondary); }
 .dsh-mcp-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .dsh-mcp-summary { display: flex; gap: 12px; flex-wrap: wrap; color: var(--dsw-alias-label-secondary); }
@@ -1136,6 +1140,8 @@ window.__ModuleLoader__.load({
       const servers = snapshot === null ? [] : snapshot.servers ?? [];
       const totals = snapshot === null ? { servers: 0, enabled: 0, connected: 0, reconnecting: 0, tools: 0 } : snapshot.totals ?? {};
       const reconnecting = servers.filter((server) => server.state === "reconnecting").length;
+      /** Host-reported package version; empty until the first snapshot arrives (or on an older host). */
+      const version = snapshot === null || snapshot.version === undefined ? "" : String(snapshot.version);
 
       // Tick once a second only while a server is counting down to its retry;
       // otherwise the status poll already refreshes every relative time.
@@ -1151,7 +1157,12 @@ window.__ModuleLoader__.load({
         h(
           "div",
           { className: "dsh-mcp-head" },
-          h("h2", { className: "dsh-mcp-title" }, t("title")),
+          h(
+            "div",
+            { className: "dsh-mcp-title-row" },
+            h("h2", { className: "dsh-mcp-title" }, t("title")),
+            version === "" ? null : h("span", { className: "dsh-mcp-version", title: t("versionHint") }, `v${version}`),
+          ),
           h("p", { className: "dsh-mcp-subtitle" }, t("subtitle")),
         ),
         h(

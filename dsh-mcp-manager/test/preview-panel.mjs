@@ -138,6 +138,7 @@ const githubTools = [
 ]
 const snapshot = {
   generation: 7,
+  version: '0.2.0',
   rowId: 'mcp-manager',
   patchMode: 'override',
   channel: { path: '/mcp-manager', state: 'registered', error: '' },
