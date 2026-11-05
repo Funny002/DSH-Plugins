@@ -30,7 +30,7 @@ dsh-skill-manager/
 
 ```sh
 dsh plugin --profile web add ./dsh-skill-manager              # 本地目录：pnpm 链接该 checkout
-dsh plugin --profile web add ./dsh-skill-manager-0.2.0.tgz    # 或交付 tarball
+dsh plugin --profile web add ./dsh-skill-manager-0.2.1.tgz    # 或交付 tarball
 dsh plugin --profile web remove dsh-skill-manager             # 连带移除依赖与组合层
 ```
 
@@ -87,7 +87,7 @@ metadata:
 | `metadata` | 否 | — | 任意对象，页面只展示、不编辑 |
 | 其他键 | 否 | — | 编辑时原样保留（例如 `license`、`allowed-tools`） |
 
-调用开关接受 YAML 布尔值以及大小写不敏感的 `true/false`、`yes/no`、`on/off`、`1/0`；`disableModelInvocation`、`modelInvocable`、`userInvocable` 这类旧写法会被明确拒绝，而不是静默放进模型目录。**同名解析**按 provider 的扫描顺序进行：先遇到的条目生效，其余条目仍然出现在页面上，标记为「已遮蔽」并显示赢家路径。
+调用开关接受 YAML 布尔值以及大小写不敏感的 `true/false`、`yes/no`、`on/off`、`1/0`；`disableModelInvocation`、`modelInvocable`、`userInvocable` 这类旧写法会被明确拒绝，而不是静默放进模型目录。**同名解析**按 provider 的扫描顺序进行：先遇到的条目生效，其余条目仍然出现在页面上，标记为「已遮蔽」并显示赢家路径。同一个文件只会算作一个技能（按绝对路径去重）——旧版宿主曾把同一个目录同时当作项目根与用户根扫描，页面不会再显示这种「自己遮蔽自己」的重复行。
 
 ## 页面功能
 
@@ -101,6 +101,8 @@ metadata:
 - **删除**：目录包删除整个目录（包括 `references/` 等资源），扁平文件只删该文件；确认框里写明绝对路径且不可撤销。
 - **异常面板**：无法解析的文件（缺 frontmatter、非法 YAML、非法调用开关）不会从列表里消失，而是列在这里——否则用户只能看到「技能没了」。
 - **页脚**：技能根目录与工作区（宿主默认工作目录）各一行。
+- **旧宿主提示**：页面只渲染技能根目录内的文件并按绝对路径去重，所以即使宿主还没重启（旧版会扫描多个根目录），也不会出现重复卡片；此时列表上方会显示一行提示，说明重启 `dsh web`（或桌面应用）后单根目录才完全生效。
+- **编辑锁定**：打开编辑/复制表单期间，卡片上的启停、编辑、复制、删除按钮会暂时禁用，避免在表单打开时切换到另一个技能；表单本身按目标路径重新挂载，草稿不会串到别的技能。
 - 页面文案固定中文：`lib/client.js` 顶部的 `PAGE_LOCALE = "zh"`，与 GUI 语言无关；改成 `"auto"` 即恢复跟随 locale 服务。zh/en 两份字典仍会注册到 `skill-manager` 命名空间。
 - 操作反馈（已创建 / 已保存 / 已复制 / 已启停…）4.5 秒后自动消失；执行新操作或打开表单会立即清掉它。失败提示不自动消失。
 
@@ -111,7 +113,7 @@ metadata:
 1. 每个 RPC 请求都重新扫描根目录，不缓存目录：外部编辑器、Git 或 shell 的改动会立刻出现在下一次 `state` 里。写操作先重新扫描、按绝对路径定位行，再落笔，避免拿旧快照写错文件。
 2. `SkillManager` 是 Cordis Service，暴露 `list()`、`get(path)`、`validate()`、`create()`、`update()`、`remove()`、`setInvocation()`、`setEnabled()`、`copy()`、`refresh()`。
 3. 写入是**原子替换**：同目录临时文件 + `rename`。改名时先移动目录（目录包）或文件（扁平），再写 `SKILL.md`，因此资源文件跟着走；未知 frontmatter 键从原文件读出后原样写回，`disable-model-invocation` 与 `user-invocable` 永远显式写出，页面开关与文件不会漂移。
-4. 路径约束：只写根目录内的文件；删除目录包前拒绝删除根目录本身；新建/改名会拒绝引入**新的**同名遮蔽（磁盘上已经存在的遮蔽行仍可编辑、改名或复制）。
+4. 路径约束：只写根目录内的文件；删除目录包前拒绝删除根目录本身；新建/改名会拒绝引入**新的**同名遮蔽（磁盘上已经存在的遮蔽行仍可编辑、改名或复制）。`resolveCatalog` 还会按绝对路径丢弃重复条目，同一个文件永远不会解析成两个技能。
 5. 技能内容由 `skill-filesystem` 自己的 watcher 索引：保存后下一次目录刷新即可见，**不需要重启**。设置页的 `state` 是本插件的视图，不读 registry 缓存，因此不会显示过期目录。
 
 **Browser 半侧**（`lib/client.js`）

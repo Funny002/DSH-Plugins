@@ -70,6 +70,7 @@ window.__ModuleLoader__.load({
       rootPath: "技能根目录",
       workspace: "工作区",
       unrecognized: "{count} 个文件无法被识别（模型看不到它们）",
+      legacyHost: "宿主仍在运行旧版技能管理器（v{version}）：本页已按技能根目录过滤并去重，重启 dsh web（或桌面应用）后完全生效。",
       showIssues: "查看",
       hideIssues: "收起",
       searchPlaceholder: "筛选名称、描述或路径",
@@ -201,6 +202,7 @@ window.__ModuleLoader__.load({
       rootPath: "Skill root",
       workspace: "Workspace",
       unrecognized: "{count} file(s) cannot be recognized (the model cannot see them)",
+      legacyHost: "The host is still running an older skill manager (v{version}); this page already filters to the skill root and de-duplicates, and restarting dsh web (or the desktop app) makes it fully effective.",
       showIssues: "Show",
       hideIssues: "Hide",
       searchPlaceholder: "Filter by name, description, or path",
@@ -468,6 +470,64 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Normalize one filesystem path for on-screen identity checks.
+     *
+     * Windows paths compare case-insensitively with forward slashes; other
+     * paths keep their case so a case-sensitive filesystem is never collapsed.
+     * @param path - path as reported by the host.
+     * @returns the comparison key.
+     */
+    function pathKey(path) {
+      const text = String(path ?? "").replace(/\\/g, "/");
+      return /^[A-Za-z]:\//.test(text) ? text.toLowerCase() : text;
+    }
+
+    /**
+     * The rows this page should render.
+     *
+     * The current host already enforces both invariants, but the page can be
+     * running against an older host that scanned several roots: a project root
+     * can coincide with the skill root, so the same file arrives twice, and the
+     * second copy is `shadowed` by a winner whose path is its own. Filtering to
+     * the managed root and de-duplicating by path keeps the page truthful until
+     * the host is restarted.
+     * @param snapshot - catalog snapshot from any host version.
+     * @returns rows under the skill root, one per file, in host order.
+     */
+    function visibleSkills(snapshot) {
+      if (snapshot === null || snapshot === undefined) return [];
+      const rows = Array.isArray(snapshot.skills) ? snapshot.skills : [];
+      const root = pathKey(skillRootOf(snapshot));
+      const seen = new Set();
+      const result = [];
+      for (const skill of rows) {
+        const key = pathKey(skill.path);
+        if (key === "") continue;
+        if (root !== "" && key !== root && !key.startsWith(root.endsWith("/") ? root : `${root}/`)) continue;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (skill.status === "shadowed" && pathKey(skill.shadowedBy) === key) continue;
+        result.push(skill);
+      }
+      return result;
+    }
+
+    /**
+     * Stable remount key for the open editor.
+     *
+     * The form seeds its draft from `initial` once, so switching from one
+     * editor target to another must remount it; otherwise the fields would show
+     * the previous skill while saving targets the new one.
+     * @param editor - `{ mode, skill }`, or null.
+     * @returns a key unique to the current editor target.
+     */
+    function editorKey(editor) {
+      if (editor === null || editor === undefined) return "none";
+      const path = editor.skill === null || editor.skill === undefined ? "" : String(editor.skill.path ?? "");
+      return `${editor.mode}:${path}`;
+    }
+
+    /**
      * One-line invocation summary for a skill row.
      * @param t - translator.
      * @param invocation - `{ modelInvocable, userInvocable }`.
@@ -615,7 +675,7 @@ window.__ModuleLoader__.load({
      * poll does not collapse them.
      */
     function SkillCard(props) {
-      const { skill, t, busy, now, detailsOpen, bodyOpen, body, onToggleEnabled, onEdit, onRemove, onCopy, onToggleDetails, onToggleBody } =
+      const { skill, t, busy, locked, now, detailsOpen, bodyOpen, body, onToggleEnabled, onEdit, onRemove, onCopy, onToggleDetails, onToggleBody } =
         props;
       const invocation = skill.invocation === undefined || skill.invocation === null ? {} : skill.invocation;
       const warnings = Array.isArray(skill.warnings) ? skill.warnings : [];
@@ -643,7 +703,7 @@ window.__ModuleLoader__.load({
               {
                 type: "button",
                 className: "dsh-skm-btn",
-                disabled: busy !== "",
+                disabled: busy !== "" || locked === true,
                 onClick: () => onToggleEnabled(skill),
               },
               invocation.modelInvocable === false && invocation.userInvocable === false ? t("start") : t("stop"),
@@ -653,7 +713,7 @@ window.__ModuleLoader__.load({
               {
                 type: "button",
                 className: "dsh-skm-btn",
-                disabled: busy !== "",
+                disabled: busy !== "" || locked === true,
                 onClick: () => onEdit(skill),
               },
               t("edit"),
@@ -663,7 +723,7 @@ window.__ModuleLoader__.load({
               {
                 type: "button",
                 className: "dsh-skm-btn ghost",
-                disabled: busy !== "",
+                disabled: busy !== "" || locked === true,
                 onClick: () => onCopy(skill),
               },
               t("copy"),
@@ -673,7 +733,7 @@ window.__ModuleLoader__.load({
               {
                 type: "button",
                 className: "dsh-skm-btn danger",
-                disabled: busy !== "",
+                disabled: busy !== "" || locked === true,
                 onClick: () => onRemove(skill),
               },
               t("remove"),
@@ -1159,15 +1219,19 @@ window.__ModuleLoader__.load({
 
       const onValidateDraft = useCallback((definition) => call("validate", { definition }), [call]);
 
-      const skills = snapshot === null ? [] : snapshot.skills ?? [];
-      const totals =
-        snapshot === null
-          ? { skills: 0, active: 0, shadowed: 0, issues: 0, model: 0, user: 0 }
-          : snapshot.totals ?? {};
+      const allSkills = visibleSkills(snapshot);
+      const active = allSkills.filter((skill) => skill.status === "active");
+      const summary = {
+        skills: allSkills.length,
+        model: active.filter((skill) => skill.invocation === undefined || skill.invocation.modelInvocable !== false).length,
+        user: active.filter((skill) => skill.invocation === undefined || skill.invocation.userInvocable !== false).length,
+        shadowed: allSkills.filter((skill) => skill.status === "shadowed").length,
+      };
       const issues = snapshot === null ? [] : snapshot.issues ?? [];
       const version = snapshot === null || snapshot.version === undefined ? "" : String(snapshot.version);
       const rootPath = skillRootOf(snapshot);
-      const visible = filterSkills(skills, search, filter);
+      const legacyHost = snapshot !== null && snapshot.skillRoot === undefined;
+      const visible = filterSkills(allSkills, search, filter);
 
       return h(
         "div",
@@ -1189,13 +1253,13 @@ window.__ModuleLoader__.load({
           h(
             "span",
             { className: "dsh-skm-summary" },
-            h("span", null, t("skills"), " ", h("b", null, String(totals.skills ?? 0))),
-            h("span", null, t("modelVisible"), " ", h("b", null, String(totals.model ?? 0))),
-            h("span", null, t("userInvocable"), " ", h("b", null, String(totals.user ?? 0))),
-            h("span", null, t("shadowed"), " ", h("b", null, String(totals.shadowed ?? 0))),
-            Number(totals.issues ?? 0) === 0
+            h("span", null, t("skills"), " ", h("b", null, String(summary.skills))),
+            h("span", null, t("modelVisible"), " ", h("b", null, String(summary.model))),
+            h("span", null, t("userInvocable"), " ", h("b", null, String(summary.user))),
+            h("span", null, t("shadowed"), " ", h("b", null, String(summary.shadowed))),
+            issues.length === 0
               ? null
-              : h("span", { className: "dsh-skm-summary-warn" }, t("issues"), " ", h("b", null, String(totals.issues))),
+              : h("span", { className: "dsh-skm-summary-warn" }, t("issues"), " ", h("b", null, String(issues.length))),
           ),
           h("span", { className: "dsh-skm-spacer" }),
           h(
@@ -1219,6 +1283,7 @@ window.__ModuleLoader__.load({
         ),
         error === "" ? null : h("div", { className: "dsh-skm-banner error" }, error),
         notice === "" ? null : h("div", { className: "dsh-skm-banner" }, notice),
+        legacyHost ? h("div", { className: "dsh-skm-banner warn" }, fill(t("legacyHost"), { version })) : null,
         h(IssuesPanel, { t, issues, open: issuesOpen, onToggle: () => setIssuesOpen((current) => !current) }),
         h(
           "div",
@@ -1246,6 +1311,7 @@ window.__ModuleLoader__.load({
         editor === null
           ? null
           : h(SkillForm, {
+              key: editorKey(editor),
               t,
               mode: editor.mode,
               original: editor.skill,
@@ -1255,7 +1321,7 @@ window.__ModuleLoader__.load({
               onSubmit: onSubmitDraft,
               onValidate: onValidateDraft,
             }),
-        skills.length === 0
+        allSkills.length === 0
           ? h(
               "div",
               { className: "dsh-skm-banner" },
@@ -1270,6 +1336,7 @@ window.__ModuleLoader__.load({
                   skill,
                   t,
                   busy,
+                  locked: editor !== null,
                   now: clock,
                   detailsOpen: detailsOpen === skill.path,
                   bodyOpen: bodyOpen === skill.path,
@@ -1371,6 +1438,8 @@ window.__ModuleLoader__.load({
       formatBytes,
       invocationLabel,
       skillRootOf,
+      visibleSkills,
+      editorKey,
       removePrompt,
       fill,
     };

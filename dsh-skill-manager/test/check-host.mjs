@@ -215,6 +215,15 @@ try {
 }
 check('findRow rejects an unknown path', findThrew)
 
+// The same file must never resolve to two rows (an older host could scan one
+// directory through two roots and produce a shadowed duplicate of itself).
+{
+  const same = rows.find((row) => row.name === 'my-skill')
+  const duplicated = scanner.resolveCatalog([same, { ...same, name: 'my-skill' }])
+  check('duplicate paths collapse to one row', duplicated.length === 1, String(duplicated.length))
+  check('the surviving row is active', duplicated[0].status === 'active')
+}
+
 // A missing root is valid empty state, not an error.
 {
   const missing = scanner.scanRoot({ path: join(temporary, 'absent'), skipSystem: true })

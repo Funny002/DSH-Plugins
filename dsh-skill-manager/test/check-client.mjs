@@ -240,6 +240,40 @@ const snapshot = {
       status: 'shadowed',
       shadowedBy: 'C:/Users/x/.dsh/skills/code-review/SKILL.md',
     },
+    {
+      // An older host whose project root coincided with the skill root listed
+      // the same file twice; the second row was shadowed by its own path.
+      name: 'code-review',
+      description: 'Duplicate row for the same instruction file.',
+      whenToUse: '',
+      invocation: { modelInvocable: true, userInvocable: true },
+      metadata: undefined,
+      bodyBytes: 842,
+      path: 'C:/Users/x/.dsh/skills/code-review/SKILL.md',
+      directory: 'C:/Users/x/.dsh/skills/code-review',
+      layout: 'bundle',
+      updatedAt: now - 90 * 1000,
+      warnings: [],
+      status: 'shadowed',
+      shadowedBy: 'C:/Users/x/.dsh/skills/code-review/SKILL.md',
+    },
+    {
+      // A skill outside the managed root; an older host still scanned project
+      // roots, the current design must not show it.
+      name: 'project-only',
+      description: 'A project skill that must stay out of this page.',
+      whenToUse: '',
+      invocation: { modelInvocable: true, userInvocable: true },
+      metadata: undefined,
+      bodyBytes: 10,
+      path: 'D:/work/demo/.dsh/skills/project-only/SKILL.md',
+      directory: 'D:/work/demo/.dsh/skills/project-only',
+      layout: 'bundle',
+      updatedAt: now - 30 * 60 * 1000,
+      warnings: [],
+      status: 'active',
+      shadowedBy: '',
+    },
   ],
   issues: [
     { path: 'C:/Users/x/.dsh/skills/broken/SKILL.md', message: '缺少 YAML frontmatter：文件必须以单独一行 --- 开头，并以单独一行 --- 结束' },
@@ -257,7 +291,7 @@ const page = await mount(plugin.__components.SkillsSection, {
 const pageText = textOf(page)
 check('the page renders the title', pageText.includes('技能'))
 check('the page renders the version badge', pageText.includes('v0.2.0'))
-check('the page lists every skill', snapshot.skills.every((skill) => pageText.includes(skill.name)))
+check('the page lists every managed skill', ['code-review', 'commit-message', 'code-review-old'].every((name) => pageText.includes(name)))
 check('the page shows the summary counts', pageText.includes('模型可见') && pageText.includes('已遮蔽'))
 check('the page shows the skill root in the footer', pageText.includes('技能根目录') && pageText.includes(rootPath))
 check('the page shows the workspace footer', pageText.includes('D:/work/demo'))
@@ -267,6 +301,8 @@ check('the page has a search box', hasProp(page, 'placeholder', '筛选名称、
 check('the page has filter options', pageText.includes('全部') && pageText.includes('已停用模型'))
 check('the shadowed row explains its winner', pageText.includes('C:/Users/x/.dsh/skills/code-review/SKILL.md'))
 check('the page has no root-management control', !pageText.includes('添加根目录') && !pageText.includes('附加根目录'))
+check('the page hides skills outside the managed root', !pageText.includes('project-only'))
+check('a current host shows no legacy warning', !pageText.includes('旧版技能管理器'))
 check('no markup text is undefined', !pageText.includes('undefined'))
 check('no markup text is NaN', !pageText.includes('NaN'))
 
@@ -375,6 +411,16 @@ check('no markup text is NaN', !pageText.includes('NaN'))
   })
   check('a transport failure is shown in a banner', textOf(pageError).includes('无法访问宿主插件'))
 }
+{
+  const pageLegacy = await mount(plugin.__components.SkillsSection, {
+    call: async () => ({ ...snapshot, skillRoot: undefined }),
+    t: strictT,
+  })
+  const legacyText = textOf(pageLegacy)
+  check('an older host shows the restart warning', legacyText.includes('旧版技能管理器'))
+  check('an older host still lists one row per file', legacyText.includes('code-review'))
+  check('an older host still hides outside-root rows', !legacyText.includes('project-only'))
+}
 
 // ── issues panel ───────────────────────────────────────────────────────────
 {
@@ -388,12 +434,13 @@ check('no markup text is NaN', !pageText.includes('NaN'))
 // ── pure helpers ───────────────────────────────────────────────────────────
 {
   const helpers = plugin.__helpers
-  check('filter by name', helpers.filterSkills(snapshot.skills, 'review', 'all').length === 2)
-  check('filter by description', helpers.filterSkills(snapshot.skills, 'conventional', 'all').length === 1)
-  check('filter by shadowed', helpers.filterSkills(snapshot.skills, '', 'shadowed').length === 1)
-  check('filter by disabled model', helpers.filterSkills(snapshot.skills, '', 'disabled').length === 1)
-  check('filter by warning', helpers.filterSkills(snapshot.skills, '', 'warned').length === 1)
-  check('filter is case-insensitive', helpers.filterSkills(snapshot.skills, 'CONVENTIONAL', 'all').length === 1)
+  const managed = helpers.visibleSkills(snapshot)
+  check('filter by name', helpers.filterSkills(managed, 'review', 'all').length === 2)
+  check('filter by description', helpers.filterSkills(managed, 'conventional', 'all').length === 1)
+  check('filter by shadowed', helpers.filterSkills(managed, '', 'shadowed').length === 1)
+  check('filter by disabled model', helpers.filterSkills(managed, '', 'disabled').length === 1)
+  check('filter by warning', helpers.filterSkills(managed, '', 'warned').length === 1)
+  check('filter is case-insensitive', helpers.filterSkills(managed, 'CONVENTIONAL', 'all').length === 1)
   check('a copy draft gets a -copy suffix', helpers.draftFromSkill(snapshot.skills[0], { body: 'b' }, 'copy').name === 'code-review-copy')
   check('an edit draft keeps the name', helpers.draftFromSkill(snapshot.skills[0], { body: 'b' }, 'edit').name === 'code-review')
   check('a draft keeps the invocation policy', helpers.draftFromSkill(snapshot.skills[1], { body: 'b' }, 'edit').modelInvocable === false)
@@ -419,6 +466,16 @@ check('no markup text is NaN', !pageText.includes('NaN'))
   check('skillRootOf prefers skillRoot', helpers.skillRootOf(snapshot) === rootPath)
   check('skillRootOf falls back to the user root', helpers.skillRootOf({ roots: [{ id: 'project-dsh', path: 'C:/project' }, { id: 'user-dsh', path: 'C:/fallback' }] }) === 'C:/fallback')
   check('skillRootOf tolerates no snapshot', helpers.skillRootOf(null) === '')
+  check('visibleSkills hides outside-root rows', helpers.visibleSkills(snapshot).every((skill) => !skill.path.includes('project-only')))
+  check('visibleSkills keeps one row per file', helpers.visibleSkills(snapshot).filter((skill) => skill.path === 'C:/Users/x/.dsh/skills/code-review/SKILL.md').length === 1)
+  check('visibleSkills drops a self-shadowed duplicate', helpers.visibleSkills(snapshot).every((skill) => !(skill.status === 'shadowed' && skill.shadowedBy === skill.path)))
+  check('visibleSkills keeps a genuine name shadow', helpers.visibleSkills(snapshot).some((skill) => skill.status === 'shadowed'))
+  check('visibleSkills tolerates a null snapshot', helpers.visibleSkills(null).length === 0)
+  check('visibleSkills uses the roots fallback on an older host', helpers.visibleSkills({ ...snapshot, skillRoot: undefined }).length === 3)
+  check('editorKey distinguishes targets', helpers.editorKey({ mode: 'edit', skill: { path: 'a' } }) !== helpers.editorKey({ mode: 'edit', skill: { path: 'b' } }))
+  check('editorKey distinguishes modes', helpers.editorKey({ mode: 'edit', skill: { path: 'a' } }) !== helpers.editorKey({ mode: 'copy', skill: { path: 'a' } }))
+  check('editorKey handles create', helpers.editorKey({ mode: 'create', skill: null }) === 'create:')
+  check('editorKey handles no editor', helpers.editorKey(null) === 'none')
   check('a bundle removal prompt names the directory', helpers.removePrompt(strictT, snapshot.skills[0]).includes('C:/Users/x/.dsh/skills/code-review'))
   check('a file removal prompt names the file', helpers.removePrompt(strictT, snapshot.skills[1]).includes('C:/Users/x/.dsh/skills/commit-message.md'))
 }

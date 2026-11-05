@@ -228,6 +228,38 @@ const call = async (endpoint) => {
 }
 
 const panel = await mount(SkillsSection, { call, t })
+
+// The shape an older host produces: the project root and the skill root are the
+// same directory, so the same file arrives twice (shadowed by its own path) and
+// a project skill leaks in. The page must show one row per file and warn.
+const legacySnapshot = {
+  ...snapshot,
+  version: '0.1.0',
+  skillRoot: undefined,
+  roots: [
+    { id: 'project-dsh', source: 'project-dsh', rank: 100, path: 'C:\\Users\\dev\\.dsh\\skills', custom: false, exists: true, skillCount: 4, issueCount: 0 },
+    { id: 'user-dsh', source: 'user-dsh', rank: 400, path: 'C:\\Users\\dev\\.dsh\\skills', custom: false, exists: true, skillCount: 4, issueCount: 0 },
+  ],
+  skills: [
+    ...snapshot.skills,
+    {
+      ...snapshot.skills[0],
+      description: 'Duplicate row produced by scanning the same directory twice.',
+      status: 'shadowed',
+      shadowedBy: snapshot.skills[0].path,
+    },
+    {
+      ...snapshot.skills[0],
+      name: 'project-only',
+      description: 'A project skill outside the managed root.',
+      path: 'D:\\work\\demo\\.dsh\\skills\\project-only\\SKILL.md',
+      directory: 'D:\\work\\demo\\.dsh\\skills\\project-only',
+      status: 'active',
+      shadowedBy: '',
+    },
+  ],
+}
+const legacyPanel = await mount(SkillsSection, { call: async () => legacySnapshot, t })
 const expandedSkill = {
   ...snapshot.skills[0],
   description: 'Review a diff for correctness, style, edge cases, and missing tests before it is committed.',
@@ -287,6 +319,8 @@ ${css}
 <body>
 <div class="preview-note">离线预览：组件与样式均取自 <code>lib/client.js</code>。示例数据含「生效 / 已停用模型 / 已遮蔽 / 有警告」四种状态，全部位于同一个技能根目录；卡片为默认折叠态，下方另有展开卡片与新建表单。</div>
 ${serialize(panel)}
+<div class="preview-split">旧宿主快照（v0.1.0：同一文件被项目根与用户根各扫一次，另有一个项目根技能混入）——页面只渲染根目录内的一行并提示重启：</div>
+<div class="dsh-skm" style="max-width:860px;margin:12px auto 0;">${serialize(legacyPanel)}</div>
 <div class="preview-split">一张展开的卡片（真实的 SkillCard，detailsOpen = true、bodyOpen = true）：</div>
 <div class="dsh-skm" style="max-width:860px;margin:12px auto 0;">${serialize(expandedCard)}</div>
 <div class="preview-split">新建表单（真实的 SkillForm）：</div>

@@ -403,14 +403,24 @@ export function scanRoot(root) {
 /**
  * Resolve duplicate names inside the single root.
  *
- * Scan order decides the winner (first entry listed by the provider wins), and
- * the losers stay in the result as `shadowed` rows so the settings page can
- * explain why a file the user can see is not the one the model loads.
+ * Two entries can describe the same name; scan order decides the winner (first
+ * entry listed by the provider wins), and the losers stay in the result as
+ * `shadowed` rows so the settings page can explain why a file the user can see
+ * is not the one the model loads. An entry whose instruction file is the same
+ * file as one already seen is dropped outright: one file is one skill, and a
+ * self-shadowed duplicate must never reach the page.
  * @param skills - discovered skills in scan order.
  * @returns rows sorted by name, active before shadowed.
  */
 export function resolveCatalog(skills) {
-  const candidates = [...skills]
+  const candidates = []
+  const seenPaths = new Set()
+  for (const skill of skills) {
+    const key = normalizeForCompare(skill.path)
+    if (seenPaths.has(key)) continue
+    seenPaths.add(key)
+    candidates.push(skill)
+  }
   const winners = new Map()
   for (const candidate of candidates) {
     const winner = winners.get(candidate.name)
