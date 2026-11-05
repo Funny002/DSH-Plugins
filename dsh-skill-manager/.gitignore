@@ -1,0 +1,4 @@
+node_modules/
+panel-preview.html
+*.log
+.DS_Store

@@ -1,0 +1,51 @@
+{
+  "name": "dsh-skill-manager",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Skill manager: a Host half that discovers the local SKILL.md bundles and flat skill files in $DSH_HOME/skills, plus a browser settings page that creates, edits, enables, disables, copies, and deletes them on disk.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/schemastery": "3.18.5"
+  },
+  "dependencies": {
+    "yaml": "^2.4.2"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "lib/index.js",
+    "lib/channel.js",
+    "lib/client.js",
+    "lib/scanner.js",
+    "test/*.mjs",
+    "README.md"
+  ],
+  "license": "MIT"
+}

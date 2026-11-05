@@ -1,0 +1,13 @@
+# dsh-skill-manager bundle layer.
+#
+# This layer ships with the package: it inserts the one manager row, so
+# `dsh plugin --profile <name> add <this package>` is the whole installation.
+#
+# There is nothing to configure here. The manager owns exactly one directory —
+# `<DSH_HOME>/skills`, the same `user-dsh` root the profile's
+# `dsh-skill-filesystem` row scans — and the skill files themselves are the
+# persisted state. The row name is the package name, not a path: the profile's
+# pnpm-installed `node_modules` is what Node resolves it through.
+- insert:
+    - id: skill-manager
+      name: dsh-skill-manager
