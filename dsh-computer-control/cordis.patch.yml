@@ -1,0 +1,11 @@
+# dsh-computer-control bundle layer.
+#
+# Inserts the one row this package owns, so installing the bundle is the whole
+# setup. The row name is the package name, not a path: the profile's
+# pnpm-installed `node_modules` is what Node resolves it through. The row's
+# config is optional - every key has a default (screenshot directory under
+# <DSH_HOME>/computer-control/screenshots, 1600 px capture cap, input enabled,
+# warm persistent runner enabled).
+- insert:
+    - id: computer-control
+      name: dsh-computer-control

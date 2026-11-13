@@ -1,0 +1,31 @@
+{
+  "name": "dsh-computer-control",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Computer control: Host tools that screenshot the Windows desktop, drive the real pointer and keyboard, control windows, and act on UI Automation controls through a supervised PowerShell runner.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "lib/index.js",
+    "lib/runner.js",
+    "lib/computer.ps1",
+    "README.md"
+  ],
+  "license": "MIT"
+}
