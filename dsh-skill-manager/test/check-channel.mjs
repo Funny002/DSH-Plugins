@@ -22,7 +22,17 @@ function makeRequest({ method = 'POST', url = `${CHANNEL}/state`, headers = { 'c
   request.method = method
   request.url = url
   request.headers = headers
-  request.destroy = () => {}
+  request.destroyed = false
+  request.paused = false
+  request.destroy = () => {
+    request.destroyed = true
+  }
+  request.pause = () => {
+    request.paused = true
+  }
+  request.resume = () => {
+    request.paused = false
+  }
   setImmediate(() => {
     if (body !== '') request.emit('data', Buffer.from(body, 'utf8'))
     request.emit('end')
@@ -36,13 +46,17 @@ function makeResponse() {
     status: 0,
     headers: {},
     body: '',
+    writableEnded: false,
+    destroyed: false,
     writeHead(status, headers) {
       response.status = status
       response.headers = headers ?? {}
       return response
     },
-    end(body) {
+    end(body, callback) {
       response.body = body ?? ''
+      response.writableEnded = true
+      if (typeof callback === 'function') setImmediate(callback)
     },
   }
   return response
@@ -135,8 +149,50 @@ for (const [label, options, status] of [
   const response = makeResponse()
   const tooLarge = 'x'.repeat(MAX_BODY_BYTES + 2048)
   const body = JSON.stringify({ type: 'client-request', rpcId: 'r6', method: 'state', payload: { text: tooLarge } })
-  await serveChannelRequest({ channel: CHANNEL, connection, dispatch }, makeRequest({ body }), response)
+  const request = makeRequest({ body })
+  await serveChannelRequest({ channel: CHANNEL, connection, dispatch }, request, response)
   check('a body over the cap is refused before parsing', response.status === 413)
+  check('an oversized request is paused rather than buffered', request.paused === true)
+  check('an oversized request keeps the socket long enough to answer', request.destroyed === false)
+  await new Promise((resolve) => setTimeout(resolve, 5))
+  check('the socket is closed once the 413 has been flushed', request.destroyed === true)
+}
+
+// ── robustness: disconnected and aborted requests ───────────────────────────
+{
+  // The browser navigated away while the host was still answering: writing to a
+  // finished response must not throw and must not reject the handler.
+  const response = makeResponse()
+  response.writableEnded = true
+  await serveChannelRequest({ channel: CHANNEL, connection, dispatch }, makeRequest({ body: envelope('r7', 'state') }), response)
+  check('an already finished response is left alone', response.status === 0, String(response.status))
+}
+{
+  // The client hung up mid-body: the read must settle instead of leaving the
+  // route handler awaiting a request that will never end.
+  const request = new EventEmitter()
+  request.method = 'POST'
+  request.url = `${CHANNEL}/state`
+  request.headers = { 'content-type': 'application/json' }
+  request.destroy = () => {}
+  request.pause = () => {}
+  const response = makeResponse()
+  setImmediate(() => {
+    request.emit('data', Buffer.from('{"type":"client-request",', 'utf8'))
+    request.emit('aborted')
+  })
+  const settled = await Promise.race([
+    serveChannelRequest({ channel: CHANNEL, connection, dispatch }, request, response).then(() => 'served'),
+    new Promise((resolve) => setTimeout(() => resolve('hung'), 250)),
+  ])
+  check('an aborted request settles', settled === 'served', settled)
+  check('an aborted request is a 400', response.status === 400, String(response.status))
+}
+{
+  // A rejected trust fence or a broken URL must stay a status code, never a throw.
+  const response = makeResponse()
+  await serveChannelRequest({ channel: CHANNEL, connection, dispatch }, makeRequest({ url: 'http://[bad' }), response)
+  check('an unparseable URL is 404', response.status === 404, String(response.status))
 }
 
 if (failures.length > 0) {

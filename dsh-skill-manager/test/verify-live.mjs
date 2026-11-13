@@ -12,7 +12,7 @@
  *
  * Every temporary skill is removed again, including on failure.
  */
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const scanner = await import(new URL('../lib/scanner.js', import.meta.url).href)
@@ -68,10 +68,13 @@ const stamp = Date.now().toString(36)
 const name = `verify-live-${stamp}`
 const renamed = `${name}-renamed`
 const flatCopy = `verify-copy-${stamp}`
+const importedName = `verify-import-${stamp}`
+const brokenName = `verify-broken-${stamp}`
 const created = []
+let root = ''
 try {
   const initial = await rpc('state')
-  const root = initial.skillRoot
+  root = initial.skillRoot
   console.log(`workspace: ${initial.workspace.cwd}`)
   console.log(`skill root: ${root}`)
   console.log(`skills: ${initial.totals.skills}, roots: ${initial.roots.map((entry) => entry.id).join(', ')}`)
@@ -143,9 +146,42 @@ try {
   check('remove deleted the bundle directory', removed.removed === true && !existsSync(updated.path))
   check('the snapshot no longer lists either skill', !removed.snapshot.skills.some((row) => row.name === renamed || row.name === flatCopy))
 
-  // 7. the root is clean again
+  // 7. import a pasted SKILL.md
+  const pasted = [
+    '---',
+    `name: ${importedName}`,
+    'description: Imported by verify-live.mjs.',
+    'license: MIT',
+    '---',
+    '',
+    '## Imported body',
+    '',
+    'Keep this line exactly.',
+    '',
+  ].join('\n')
+  const imported = await rpc('import', { text: pasted })
+  created.push(imported.path)
+  check('import wrote the pasted skill', existsSync(imported.path) && imported.path === join(root, importedName, 'SKILL.md'), imported.path)
+  check('import kept the pasted text byte for byte', readFileSync(imported.path, 'utf8') === pasted)
+  const importedDetail = await rpc('get', { path: imported.path })
+  check('import preserved unknown frontmatter keys', importedDetail.frontmatter.license === 'MIT')
+  check('import kept the body', importedDetail.body.includes('Keep this line exactly.'))
+  await rpc('remove', { path: imported.path })
+
+  // 8. an unreadable entry can be discarded from the issues panel
+  const brokenDirectory = join(root, brokenName)
+  mkdirSync(brokenDirectory, { recursive: true })
+  writeFileSync(join(brokenDirectory, 'SKILL.md'), '# no frontmatter\n', 'utf8')
+  const brokenState = await rpc('state')
+  const brokenIssue = brokenState.issues.find((issue) => issue.path === join(brokenDirectory, 'SKILL.md'))
+  check('a malformed file is reported as an issue', brokenIssue !== undefined)
+  const discarded = await rpc('discard', { path: brokenIssue.path })
+  check('discard removed the unreadable bundle', discarded.removed === true && !existsSync(brokenDirectory))
+
+  // 9. the root is clean again
   const finalState = await rpc('state')
   check('the final state has no verification skill', !finalState.skills.some((row) => row.name.startsWith('verify-')))
+  check('the final state has no verification issue', !finalState.issues.some((issue) => issue.path.includes(brokenName)))
   check('the final state still has exactly one root', finalState.roots.length === 1)
   check('refresh answers with a snapshot', Array.isArray((await rpc('refresh', {})).skills))
 } catch (error) {
@@ -153,11 +189,17 @@ try {
 } finally {
   for (const path of created) {
     try {
+      await rpc('discard', { path })
+    } catch {
+      /* best effort cleanup */
+    }
+    try {
       await rpc('remove', { path })
     } catch {
       /* best effort cleanup */
     }
   }
+  rmSync(join(root, brokenName), { recursive: true, force: true })
 }
 
 if (failures.length > 0) {

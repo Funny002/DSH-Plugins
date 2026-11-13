@@ -8,10 +8,13 @@
  *    — and parses every `SKILL.md` bundle and flat `<name>.md` file exactly the
  *    way that provider does, including a report of files the provider would
  *    silently skip.
- * 2. **Author.** It creates, edits, renames, copies, enables, disables, and
- *    deletes those files on disk. Because the provider watches that root, a
+ * 2. **Author.** It creates, edits, renames, copies, imports, enables, disables,
+ *    and deletes those files on disk. Because the provider watches that root, a
  *    saved skill reaches the next model catalog without a restart; there is no
- *    second copy of the skill in this plugin's config.
+ *    second copy of the skill in this plugin's config. A file the provider would
+ *    skip (missing or malformed frontmatter, a BOM, an oversized file) is
+ *    reported as an issue and can be deleted from the page, so an unreadable
+ *    skill is never a dead end nobody can fix.
  * 3. **Answer.** It provides the `skillManager` service and an authenticated
  *    `/skill-manager` RPC channel on `ctx.connection`, which is how the browser
  *    settings page reads the catalog and mutates skill files.
@@ -24,17 +27,22 @@
  * @module dsh-skill-manager
  */
 import { existsSync, readFileSync, renameSync, rmSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { basename, dirname, resolve } from 'node:path'
 import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { serveChannelRequest } from './channel.js'
 import {
+  SKILL_FILENAME,
   SKILL_NAME,
+  USER_ROOT_RANK,
   errorMessage,
   findRow,
+  forgetSkillHeader,
+  isInside,
   isRecord,
   normalizeDefinition,
   normalizeForCompare,
+  parseSkillText,
   readSkillFile,
   renderSkillFile,
   resolveCatalog,
@@ -52,14 +60,16 @@ export const name = 'skill-manager'
 export const inject = []
 /** Absolute RPC channel the browser settings page calls. */
 export const CHANNEL = '/skill-manager'
+/** Shown when the manifest cannot be read; never a valid published version. */
+const UNKNOWN_VERSION = '0.0.0'
 /**
  * The installed package version, read from this package's own `package.json` so
  * the settings page can show a single version identity. A missing or unreadable
- * manifest must not fail the row: the badge is diagnostic, not functional.
+ * manifest must not fail the row: the badge is diagnostic, not functional. The
+ * fallback constant is declared above this call because module evaluation order
+ * would otherwise read it in its temporal dead zone.
  */
 export const VERSION = readPackageVersion()
-/** Shown when the manifest cannot be read; never a valid published version. */
-const UNKNOWN_VERSION = '0.0.0'
 
 /**
  * Read `version` from the package manifest beside this module.
@@ -156,18 +166,22 @@ export class SkillManager extends Service {
    */
   list() {
     const { root, rows, issues, exists } = this.scan()
-    const active = rows.filter((row) => row.status === 'active')
-    const totals = {
-      skills: rows.length,
-      active: active.length,
-      shadowed: rows.length - active.length,
-      issues: issues.length,
-      model: active.filter((row) => row.invocation.modelInvocable).length,
-      user: active.filter((row) => row.invocation.userInvocable).length,
-      disabled: active.filter((row) => !row.invocation.modelInvocable).length,
-      roots: 1,
-      bundles: rows.filter((row) => row.layout === 'bundle').length,
-      files: rows.filter((row) => row.layout === 'file').length,
+    /*
+     * One pass over the rows: the page polls this payload, and a root with a few
+     * hundred skills should not be walked six times per request.
+     */
+    const totals = { skills: rows.length, active: 0, shadowed: 0, issues: issues.length, model: 0, user: 0, disabled: 0, roots: 1, bundles: 0, files: 0 }
+    for (const row of rows) {
+      if (row.layout === 'bundle') totals.bundles += 1
+      else totals.files += 1
+      if (row.status !== 'active') {
+        totals.shadowed += 1
+        continue
+      }
+      totals.active += 1
+      if (row.invocation.modelInvocable) totals.model += 1
+      else totals.disabled += 1
+      if (row.invocation.userInvocable) totals.user += 1
     }
     return {
       generation: this.generation,
@@ -183,7 +197,7 @@ export class SkillManager extends Service {
         {
           id: 'user-dsh',
           source: 'user-dsh',
-          rank: 400,
+          rank: USER_ROOT_RANK,
           path: root.path,
           custom: false,
           exists,
@@ -247,10 +261,14 @@ export class SkillManager extends Service {
     if (!isRecord(input)) throw new Error('技能定义必须是一个对象')
     const layout = input.layout === 'file' ? 'file' : 'bundle'
     const definition = normalizeDefinition(input, { layout })
-    this.assertUniqueName(definition.name)
+    const { rows } = this.scan()
+    this.assertUniqueName(definition.name, undefined, rows)
     const target = skillPathFor(this.root().path, definition.name, layout)
-    if (existsSync(target)) throw new Error(`目标文件已存在：${target}`)
-    writeSkillFile(target, renderSkillFile(definition))
+    try {
+      writeSkillFile(target, renderSkillFile(definition), { root: this.root().path, exclusive: true })
+    } catch (error) {
+      throw this.existingTargetError(error, target)
+    }
     this.generation = Date.now()
     return {
       created: true,
@@ -278,10 +296,12 @@ export class SkillManager extends Service {
     const definition = normalizeDefinition({ name: row.name, ...input }, { layout: row.layout })
     // A shadowed row may keep its name: it was created outside this page and
     // must stay editable. Only an actual rename can introduce a new collision.
-    if (definition.name !== row.name) this.assertUniqueName(definition.name, row.path)
+    if (definition.name !== row.name) this.assertUniqueName(definition.name, row.path, rows)
     let target = row.path
     if (definition.name !== row.name) {
       target = skillPathFor(this.root().path, definition.name, row.layout)
+      // `rename` replaces the destination on POSIX, so the destination must be
+      // known absent before the move; on Windows the rename itself also refuses.
       if (existsSync(target)) throw new Error(`目标文件已存在：${target}`)
       if (row.layout === 'bundle') {
         const fromDirectory = dirname(row.path)
@@ -294,7 +314,17 @@ export class SkillManager extends Service {
         renameSync(row.path, target)
       }
     }
-    writeSkillFile(target, renderSkillFile(definition, base.data))
+    try {
+      writeSkillFile(target, renderSkillFile(definition, base.data), { root: this.root().path })
+    } catch (error) {
+      /*
+       * A failed write after a successful move would leave the bundle under a
+       * name its frontmatter no longer matches. Put it back and say so, rather
+       * than reporting only the write failure.
+       */
+      const rollback = target === row.path ? '' : restoreRenamedPath(target, row.path)
+      throw new Error(`${errorMessage(error)}${rollback}`, { cause: error })
+    }
     this.generation = Date.now()
     return {
       updated: true,
@@ -312,17 +342,22 @@ export class SkillManager extends Service {
   remove(path) {
     const { rows } = this.scan()
     const row = findRow(rows, path)
+    const root = this.root().path
     if (row.layout === 'bundle') {
       const directory = dirname(row.path)
       // Defensive: a bundle instruction file is always one directory below the
-      // root; never let a path quirk turn "delete skill" into "delete root".
-      if (normalizeForCompare(directory) === normalizeForCompare(this.root().path)) {
-        throw new Error(`拒绝删除技能根目录本身：${directory}`)
+      // root; never let a path quirk turn "delete skill" into "delete root" or
+      // into a delete outside the managed root. A junction or symlink is removed
+      // as a link, never as its target.
+      if (normalizeForCompare(directory) === normalizeForCompare(root) || !isInside(root, directory)) {
+        throw new Error(`拒绝删除技能根目录本身（或根目录之外的位置）：${directory}`)
       }
       rmSync(directory, { recursive: true, force: true })
     } else {
+      if (!isInside(root, row.path)) throw new Error(`拒绝删除技能根目录之外的文件：${row.path}`)
       rmSync(row.path, { force: true })
     }
+    forgetSkillHeader(row.path)
     this.generation = Date.now()
     return {
       removed: true,
@@ -353,7 +388,7 @@ export class SkillManager extends Service {
       body: current.body,
       layout: row.layout,
     }
-    writeSkillFile(row.path, renderSkillFile(definition, current.data))
+    writeSkillFile(row.path, renderSkillFile(definition, current.data), { root: this.root().path })
     this.generation = Date.now()
     return {
       updated: true,
@@ -393,9 +428,8 @@ export class SkillManager extends Service {
       throw new Error(`技能名称 ${JSON.stringify(name)} 无效：只能使用小写字母、数字，并用单个连字符分隔（kebab-case）`)
     }
     const layout = values.layout === 'file' || values.layout === 'bundle' ? values.layout : row.layout
-    this.assertUniqueName(name)
+    this.assertUniqueName(name, undefined, rows)
     const target = skillPathFor(this.root().path, name, layout)
-    if (existsSync(target)) throw new Error(`目标文件已存在：${target}`)
     const definition = {
       name,
       description: source.description,
@@ -406,13 +440,108 @@ export class SkillManager extends Service {
       body: source.body,
       layout,
     }
-    writeSkillFile(target, renderSkillFile(definition, source.data))
+    try {
+      writeSkillFile(target, renderSkillFile(definition, source.data), { root: this.root().path, exclusive: true })
+    } catch (error) {
+      throw this.existingTargetError(error, target)
+    }
     this.generation = Date.now()
     return {
       copied: true,
       from: row.path,
       path: target,
       layout,
+      snapshot: this.list(),
+    }
+  }
+
+  /**
+   * Create one skill from the full text of a `SKILL.md`.
+   *
+   * The form edits fields; this path is the other direction — a skill pasted
+   * from a chat, a gist, or another machine. The text is parsed with the same
+   * rules as a file on disk, so what the import accepts is exactly what the
+   * provider would load. When the text is kept as-is, its formatting and unknown
+   * frontmatter keys survive byte for byte; only a forced rename re-renders it.
+   * @param input - `{ text, name?, layout? }`.
+   * @returns the import receipt plus the refreshed snapshot.
+   */
+  importSkill(input) {
+    const values = isRecord(input) ? input : {}
+    const text = typeof values.text === 'string' ? values.text : ''
+    if (text.trim() === '') throw new Error('导入内容为空：请粘贴完整的 SKILL.md（frontmatter 与正文）')
+    const parsed = parseSkillText(text)
+    const requested = String(values.name ?? '').trim()
+    const name = requested === '' ? parsed.name : requested
+    if (!SKILL_NAME.test(name)) {
+      throw new Error(`技能名称 ${JSON.stringify(name)} 无效：只能使用小写字母、数字，并用单个连字符分隔（kebab-case）`)
+    }
+    const layout = values.layout === 'file' ? 'file' : 'bundle'
+    const { rows } = this.scan()
+    this.assertUniqueName(name, undefined, rows)
+    const target = skillPathFor(this.root().path, name, layout)
+    const rendered =
+      name === parsed.name
+        ? text
+        : renderSkillFile(
+            {
+              name,
+              description: parsed.description,
+              whenToUse: parsed.whenToUse ?? '',
+              modelInvocable: parsed.invocation.modelInvocable,
+              userInvocable: parsed.invocation.userInvocable,
+              metadata: parsed.metadata,
+              body: parsed.body,
+              layout,
+            },
+            parsed.data,
+          )
+    try {
+      writeSkillFile(target, rendered, { root: this.root().path, exclusive: true })
+    } catch (error) {
+      throw this.existingTargetError(error, target)
+    }
+    this.generation = Date.now()
+    return {
+      imported: true,
+      name,
+      path: target,
+      layout,
+      snapshot: this.list(),
+    }
+  }
+
+  /**
+   * Delete one entry that the scan could not read as a skill.
+   *
+   * A malformed `SKILL.md` is invisible to the model and therefore to every
+   * other surface, and the page offers no way to fix or remove it: this closes
+   * that dead end. Only a path the current scan reports as an issue is eligible,
+   * so a valid skill can never be deleted through this endpoint by mistake.
+   * @param path - issue path from the snapshot's `issues` list.
+   * @returns the removal receipt plus the refreshed snapshot.
+   */
+  discard(path) {
+    const root = this.root().path
+    const { issues } = this.scan()
+    const wanted = normalizeForCompare(String(path ?? ''))
+    const issue = issues.find((candidate) => normalizeForCompare(candidate.path) === wanted)
+    if (issue === undefined) {
+      throw new Error(`没有找到该异常条目（可能已被修复或删除）：${String(path ?? '')}`)
+    }
+    if (normalizeForCompare(issue.path) === normalizeForCompare(root) || !isInside(root, issue.path)) {
+      throw new Error(`拒绝删除技能根目录本身（或根目录之外的位置）：${issue.path}`)
+    }
+    // An unreadable bundle is still a bundle: its directory goes, resources and all.
+    const bundle = normalizeForCompare(basename(issue.path)) === normalizeForCompare(SKILL_FILENAME)
+    if (bundle) rmSync(dirname(issue.path), { recursive: true, force: true })
+    else rmSync(issue.path, { recursive: true, force: true })
+    forgetSkillHeader(issue.path)
+    this.generation = Date.now()
+    return {
+      removed: true,
+      path: issue.path,
+      directory: bundle ? dirname(issue.path) : root,
       snapshot: this.list(),
     }
   }
@@ -434,9 +563,10 @@ export class SkillManager extends Service {
    * unfixable.
    * @param name - candidate skill name.
    * @param exceptPath - the file being renamed, excluded from the comparison.
+   * @param scanned - rows a caller already scanned, so a mutation reads the disk once.
    */
-  assertUniqueName(name, exceptPath) {
-    const { rows } = this.scan()
+  assertUniqueName(name, exceptPath, scanned) {
+    const rows = scanned ?? this.scan().rows
     const conflict = rows.find(
       (row) =>
         row.name === name &&
@@ -448,8 +578,19 @@ export class SkillManager extends Service {
     }
   }
 
-  /** Release nothing today; kept as the HMR disposal seam for future state. */
-  dispose() {}
+  /**
+   * Translate a lost create race into the same message a pre-check would give.
+   *
+   * The exclusive write is what makes the check race-free; without this
+   * translation the user would see a raw `EEXIST` from the filesystem instead.
+   * @param error - rejection from `writeSkillFile`.
+   * @param target - the path that was being created.
+   * @returns the error to throw.
+   */
+  existingTargetError(error, target) {
+    if (error && typeof error === 'object' && error.code === 'EEXIST') return new Error(`目标文件已存在：${target}`)
+    return error
+  }
 
   /**
    * Dispatch one RPC endpoint.
@@ -480,6 +621,10 @@ export class SkillManager extends Service {
         return this.setEnabled(args.path, false)
       case 'copy':
         return this.copy(args.path, args.definition ?? args)
+      case 'import':
+        return this.importSkill(args.definition ?? args)
+      case 'discard':
+        return this.discard(args.path)
       case 'refresh':
         return this.refresh()
       default:
@@ -494,20 +639,32 @@ export class SkillManager extends Service {
  * @returns the unique strings.
  */
 function dedupe(values) {
-  const result = []
-  for (const value of values) if (!result.includes(value)) result.push(value)
-  return result
+  return [...new Set(values)]
 }
 
 /**
- * Plugin entry: build the manager, answer the browser channel, and release the
- * managed state with the fiber.
+ * Move a renamed skill back after its rewrite failed.
+ * @param from - the path the skill now occupies.
+ * @param to - the path it came from.
+ * @returns a suffix for the failure message: empty on success, an explanation otherwise.
+ */
+function restoreRenamedPath(from, to) {
+  try {
+    renameSync(from, to)
+    return '（原路径已恢复）'
+  } catch (error) {
+    return `（并且无法恢复到原路径 ${to}：${errorMessage(error)}）`
+  }
+}
+
+/**
+ * Plugin entry: build the manager and answer the browser channel. Both halves
+ * read the skill files directly, so there is nothing else to keep alive.
  * @param ctx - host plugin context.
  * @param config - resolved row config.
  */
 export function apply(ctx, config) {
   const manager = new SkillManager(ctx, config)
-  ctx.effect(() => () => manager.dispose(), 'skill-manager: managed skill files')
   /*
    * The channel route is registered directly on the web server rather than
    * through `ctx.connection.rpc.handle`: Connection hosts one interceptor on the
@@ -521,28 +678,47 @@ export function apply(ctx, config) {
   ctx.inject(['connection', 'webServer'], (webCtx) => {
     try {
       const connection = webCtx.connection
-      webCtx.effect(
-        () =>
-          webCtx.webServer.register({
-            kind: 'prefix',
-            path: CHANNEL,
-            handler: (req, res) => {
-              void serveChannelRequest(
-                {
-                  channel: CHANNEL,
-                  connection,
-                  dispatch: (endpoint, payload) => manager.dispatch(endpoint, payload),
-                },
-                req,
-                res,
-              )
-            },
-          }),
-        `dsh-skill-manager: ${CHANNEL} RPC route`,
-      )
-      manager.channel.state = 'registered'
-      manager.channel.error = ''
-      webCtx.logger.info('skill-manager: browser channel %s is live', CHANNEL)
+      webCtx.effect(() => {
+        const disposeRoute = webCtx.webServer.register({
+          kind: 'prefix',
+          path: CHANNEL,
+          handler: (req, res) => {
+            /*
+             * The route handler cannot await, so it must own the rejection: an
+             * unawaited failure here would surface as an unhandled rejection and
+             * take the host process down instead of failing one request.
+             */
+            serveChannelRequest(
+              {
+                channel: CHANNEL,
+                connection,
+                dispatch: (endpoint, payload) => manager.dispatch(endpoint, payload),
+              },
+              req,
+              res,
+            ).catch((error) => {
+              webCtx.logger.error('skill-manager: %s request failed: %s', CHANNEL, errorMessage(error))
+              if (res.writableEnded || res.destroyed) return
+              try {
+                res.writeHead(500, { 'content-type': 'text/plain' })
+                res.end('internal error')
+              } catch {
+                /* the socket is already gone; the log above is the record */
+              }
+            })
+          },
+        })
+        manager.channel.state = 'registered'
+        manager.channel.error = ''
+        webCtx.logger.info('skill-manager: browser channel %s is live', CHANNEL)
+        // The snapshot reports the route's real state, so HMR disposal must not
+        // keep claiming a channel that no longer answers.
+        return () => {
+          manager.channel.state = 'closed'
+          manager.channel.error = ''
+          disposeRoute()
+        }
+      }, `dsh-skill-manager: ${CHANNEL} RPC route`)
     } catch (error) {
       manager.channel.state = 'failed'
       manager.channel.error = errorMessage(error)

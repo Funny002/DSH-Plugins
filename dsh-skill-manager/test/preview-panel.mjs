@@ -117,7 +117,7 @@ globalThis.window = {
 }
 await import(new URL('../lib/client.js', import.meta.url).href)
 const plugin = registered.exports
-const { SkillsSection, SkillCard, SkillForm } = plugin.__components
+const { SkillsSection, SkillCard, SkillForm, ImportForm, IssuesPanel } = plugin.__components
 const dictionary = plugin.__dictionaries.zh
 const t = (key) => {
   let value = dictionary
@@ -295,6 +295,20 @@ const form = await mount(SkillForm, {
     target: 'C:/Users/dev/.dsh/skills/new-skill/SKILL.md',
   }),
 })
+const importForm = await mount(ImportForm, {
+  t,
+  rootPath: snapshot.skillRoot,
+  initial: plugin.__helpers.emptyImportDraft(),
+  onCancel: () => {},
+  onSubmit: () => {},
+})
+const issuesPanel = await mount(IssuesPanel, {
+  t,
+  issues: snapshot.issues,
+  open: true,
+  onToggle: () => {},
+  onDiscard: () => {},
+})
 
 // The stylesheet lives inside the factory scope; re-read it from the bundle text.
 const bundleSource = await import('node:fs').then((fs) => fs.readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'))
@@ -317,14 +331,18 @@ body{margin:0;padding:28px;background:#ffffff;font-family:-apple-system,"Segoe U
 ${css}
 </style></head>
 <body>
-<div class="preview-note">离线预览：组件与样式均取自 <code>lib/client.js</code>。示例数据含「生效 / 已停用模型 / 已遮蔽 / 有警告」四种状态，全部位于同一个技能根目录；卡片为默认折叠态，下方另有展开卡片与新建表单。</div>
+<div class="preview-note">离线预览：组件与样式均取自 <code>lib/client.js</code>。示例数据含「生效 / 已停用模型 / 已遮蔽 / 有警告」四种状态，全部位于同一个技能根目录；卡片为默认折叠态，下方另有展开卡片、异常面板、新建表单与导入表单。</div>
 ${serialize(panel)}
 <div class="preview-split">旧宿主快照（v0.1.0：同一文件被项目根与用户根各扫一次，另有一个项目根技能混入）——页面只渲染根目录内的一行并提示重启：</div>
 <div class="dsh-skm" style="max-width:860px;margin:12px auto 0;">${serialize(legacyPanel)}</div>
 <div class="preview-split">一张展开的卡片（真实的 SkillCard，detailsOpen = true、bodyOpen = true）：</div>
 <div class="dsh-skm" style="max-width:860px;margin:12px auto 0;">${serialize(expandedCard)}</div>
+<div class="preview-split">异常面板（真实的 IssuesPanel，展开并带「删除」动作）：</div>
+<div class="dsh-skm" style="max-width:860px;margin:12px auto 0;">${serialize(issuesPanel)}</div>
 <div class="preview-split">新建表单（真实的 SkillForm）：</div>
 <div class="dsh-skm" style="max-width:860px;margin:12px auto 0;">${serialize(form)}</div>
+<div class="preview-split">导入表单（真实的 ImportForm）：</div>
+<div class="dsh-skm" style="max-width:860px;margin:12px auto 0;">${serialize(importForm)}</div>
 </body></html>`
 
 const output = process.argv[2] ?? new URL('../panel-preview.html', import.meta.url).pathname.replace(/^\//, '')

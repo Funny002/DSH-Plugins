@@ -31,6 +31,23 @@ export const MAX_BODY_BYTES = 1048576
 const INVALID_RPC_ID = 'invalid-request'
 /** Endpoint segments accepted by Connection's own channels. */
 const ENDPOINT_SEGMENT_PATTERN = /^[A-Za-z0-9_$.-]+$/
+/** Failure code for a body over {@link MAX_BODY_BYTES}. */
+const BODY_TOO_LARGE = 'BODY_TOO_LARGE'
+/** Failure code for a body that is not JSON. */
+const BODY_NOT_JSON = 'BODY_NOT_JSON'
+
+/**
+ * Build one tagged body-read failure, so the caller matches on the cause rather
+ * than on an English message.
+ * @param code - machine-readable failure code.
+ * @param message - transport-level explanation.
+ * @returns the error to reject with.
+ */
+function bodyError(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
+}
 
 /**
  * Extract the channel-relative endpoint from a request path.
@@ -50,11 +67,15 @@ export function endpointFromPath(channel, pathname) {
  * @param res - node:http response.
  * @param rpcId - correlation id from the request.
  * @param result - success or failure branch.
+ * @returns whether the response was written.
  */
 function sendResult(res, rpcId, result) {
+  // A disconnected browser must not turn into an unhandled stream error.
+  if (res.writableEnded || res.destroyed) return false
   const body = JSON.stringify({ type: 'server-response', rpcId, result })
   res.writeHead(200, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) })
   res.end(body)
+  return true
 }
 
 /**
@@ -64,36 +85,52 @@ function sendResult(res, rpcId, result) {
  * @param code - machine-readable failure code.
  * @param message - human-readable failure message.
  * @param details - structured failure details (always an object).
+ * @returns whether the response was written.
  */
 function sendFailure(res, rpcId, code, message, details = {}) {
-  sendResult(res, rpcId, { ok: false, error: { code, message, details } })
+  return sendResult(res, rpcId, { ok: false, error: { code, message, details } })
 }
 
 /**
  * Read a bounded JSON body from a node:http request.
+ *
+ * The promise settles exactly once. An oversized body is not read to the end —
+ * the stream is paused and the caller answers `413` — and a browser that hangs
+ * up before finishing settles the read instead of leaving the handler waiting on
+ * a request that will never end.
  * @param req - node:http request.
  * @returns the parsed JSON value.
- * @throws when the body exceeds the cap, is not JSON, or the stream fails.
+ * @throws a {@link bodyError} when the body exceeds the cap, is not JSON, or the
+ * stream aborts.
  */
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
     let size = 0
+    let settled = false
+    const settle = (callback, value) => {
+      if (settled) return
+      settled = true
+      callback(value)
+    }
     req.on('data', (chunk) => {
+      if (settled) return
       size += chunk.length
       if (size > MAX_BODY_BYTES) {
-        reject(new Error('request body is too large'))
-        req.destroy()
+        settle(reject, bodyError(BODY_TOO_LARGE, 'request body is too large'))
+        // Stop buffering but keep the socket writable so the 413 can be sent.
+        req.pause()
         return
       }
       chunks.push(chunk)
     })
-    req.on('error', reject)
+    req.on('aborted', () => settle(reject, bodyError(BODY_NOT_JSON, 'request aborted before the body ended')))
+    req.on('error', (error) => settle(reject, error))
     req.on('end', () => {
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
+        settle(resolve, JSON.parse(Buffer.concat(chunks).toString('utf8')))
       } catch {
-        reject(new Error('body is not JSON'))
+        settle(reject, bodyError(BODY_NOT_JSON, 'body is not JSON'))
       }
     })
   })
@@ -114,7 +151,13 @@ export async function serveChannelRequest(options, req, res) {
     res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
     return
   }
-  const endpoint = endpointFromPath(channel, new URL(req.url ?? '/', 'http://dsh.invalid').pathname)
+  let pathname
+  try {
+    pathname = new URL(req.url ?? '/', 'http://dsh.invalid').pathname
+  } catch {
+    pathname = ''
+  }
+  const endpoint = endpointFromPath(channel, pathname)
   if (req.method !== 'POST' || endpoint === undefined) {
     res.writeHead(404, { 'content-type': 'text/plain' })
     res.end('not found')
@@ -131,9 +174,15 @@ export async function serveChannelRequest(options, req, res) {
     body = await readJsonBody(req)
   } catch (error) {
     const message = errorMessage(error)
-    if (message === 'request body is too large') {
-      res.writeHead(413, { 'content-type': 'text/plain' })
-      res.end(message)
+    const code = error && typeof error === 'object' ? error.code : undefined
+    if (code === BODY_TOO_LARGE) {
+      /*
+       * The body is still arriving, so the socket is destroyed only after the
+       * response is flushed; destroying it first turns the 413 into a reset the
+       * page can only report as a transport failure.
+       */
+      res.writeHead(413, { 'content-type': 'text/plain', connection: 'close' })
+      res.end(message, () => req.destroy())
       return
     }
     res.writeHead(400, { 'content-type': 'text/plain' })

@@ -2,12 +2,13 @@
  * `dsh-skill-manager` — browser half.
  *
  * Registers one `settings.section` page ("Skills") that lists every local skill
- * discovered under the project, user, and extra skill roots, and creates, edits,
- * enables, disables, copies, and deletes those files. Every mutation goes through
- * the authenticated `/skill-manager` RPC channel owned by the host half, which
- * writes `SKILL.md` (or `<name>.md`) on disk; the profile's filesystem skill
- * provider picks the change up from its own watcher, so no plugin restart is
- * involved.
+ * discovered under the single managed root, and creates, imports, edits,
+ * enables, disables, copies, and deletes those files. It also lists the files
+ * that look like skills but cannot be parsed, and can delete them. Every
+ * mutation goes through the authenticated `/skill-manager` RPC channel owned by
+ * the host half, which writes `SKILL.md` (or `<name>.md`) on disk; the profile's
+ * filesystem skill provider picks the change up from its own watcher, so no
+ * plugin restart is involved.
  *
  * This file is the package's built `./client` artifact: a lazy-CJS factory that
  * the shell's module loader registers during boot, exactly like the shipped
@@ -35,15 +36,24 @@ window.__ModuleLoader__.load({
     const POLL_MS = 8000;
     /** How long a persisted-change status notice stays on screen, in milliseconds. */
     const NOTICE_MS = 4500;
+    /**
+     * Relative timestamps ("4 分钟前") tick on their own, slower cadence: a poll
+     * that changed nothing must not re-render the whole catalog every 8 seconds.
+     */
+    const CLOCK_MS = 60000;
+    /** How many opened bodies stay cached before the oldest are dropped. */
+    const BODY_CACHE_LIMIT = 32;
 
     //#region dictionaries
     const zh = {
       nav: "技能",
       title: "技能",
-      subtitle: "管理本地 SKILL.md 技能：新建、编辑、启停、复制与删除；所有技能都在技能根目录里，保存后模型侧会在下一次目录刷新时看到。",
+      subtitle:
+        "管理本地 SKILL.md 技能：新建、导入、编辑、启停、复制与删除；所有技能都在技能根目录里，保存后模型侧会在下一次目录刷新时看到。",
       versionHint: "插件版本",
       refresh: "刷新",
       create: "新建技能",
+      importSkill: "导入",
       empty: "还没有发现本地技能。",
       emptyHint: "新建技能会写入技能根目录（{path}）；模型侧在下一次目录刷新时看到它。",
       emptyFiltered: "没有匹配的技能。",
@@ -73,9 +83,11 @@ window.__ModuleLoader__.load({
       legacyHost: "宿主仍在运行旧版技能管理器（v{version}）：本页已按技能根目录过滤并去重，重启 dsh web（或桌面应用）后完全生效。",
       showIssues: "查看",
       hideIssues: "收起",
+      discard: "删除",
       searchPlaceholder: "筛选名称、描述或路径",
       confirmRemoveBundle: "删除技能 “{name}”？会删除整个目录 {path}，包括其中的资源文件，且无法撤销。",
       confirmRemoveFile: "删除技能 “{name}”？会删除文件 {path}，且无法撤销。",
+      confirmDiscard: "删除这个无法识别的条目？会删除 {path}，且无法撤销。",
       chip: {
         shadowed: "已遮蔽",
         warning: "注意",
@@ -144,6 +156,13 @@ window.__ModuleLoader__.load({
         invalid: "请先补全必填项。",
         bundle: "目录（<名称>/SKILL.md）",
         file: "单文件（<名称>.md）",
+        importTitle: "导入 SKILL.md",
+        importNote: "粘贴完整的 SKILL.md（frontmatter 与正文）：先按磁盘文件的规则解析，通过后才写入技能根目录，未知 frontmatter 键原样保留。",
+        importText: "SKILL.md 内容",
+        importTextHint: "第一行必须是单独一行 ---，之后是 frontmatter，再以单独一行 --- 结束，正文写在后面。",
+        importName: "技能名称（可选）",
+        importNameHint: "留空则使用 frontmatter 里的 name；填写则按新名称保存并改写 frontmatter。",
+        importEmpty: "请先粘贴 SKILL.md 内容。",
       },
       validate: {
         ok: "定义有效。",
@@ -160,6 +179,8 @@ window.__ModuleLoader__.load({
         started: "已启用 {name}。",
         stopped: "已停用 {name}。",
         refreshed: "已重新扫描技能目录。",
+        imported: "已导入技能 {name}。",
+        discarded: "已删除异常条目 {name}。",
       },
       error: {
         noConnection: "浏览器连接服务不可用。",
@@ -172,10 +193,12 @@ window.__ModuleLoader__.load({
     const en = {
       nav: "Skills",
       title: "Skills",
-      subtitle: "Manage local SKILL.md skills: create, edit, enable, disable, copy, and delete them; every skill lives in the skill root, and the model side sees a save on its next catalog refresh.",
+      subtitle:
+        "Manage local SKILL.md skills: create, import, edit, enable, disable, copy, and delete them; every skill lives in the skill root, and the model side sees a save on its next catalog refresh.",
       versionHint: "Plugin version",
       refresh: "Refresh",
       create: "New skill",
+      importSkill: "Import",
       empty: "No local skill has been discovered yet.",
       emptyHint: "A new skill is written to the skill root ({path}); the model side sees it on the next catalog refresh.",
       emptyFiltered: "No matching skill.",
@@ -205,9 +228,11 @@ window.__ModuleLoader__.load({
       legacyHost: "The host is still running an older skill manager (v{version}); this page already filters to the skill root and de-duplicates, and restarting dsh web (or the desktop app) makes it fully effective.",
       showIssues: "Show",
       hideIssues: "Hide",
+      discard: "Delete",
       searchPlaceholder: "Filter by name, description, or path",
       confirmRemoveBundle: "Remove skill “{name}”? The whole directory {path} is deleted, including its resource files; this cannot be undone.",
       confirmRemoveFile: "Remove skill “{name}”? The file {path} is deleted; this cannot be undone.",
+      confirmDiscard: "Delete this unreadable entry? {path} is deleted; this cannot be undone.",
       chip: {
         shadowed: "Shadowed",
         warning: "Warning",
@@ -276,6 +301,14 @@ window.__ModuleLoader__.load({
         invalid: "Complete the required fields first.",
         bundle: "Directory (<name>/SKILL.md)",
         file: "Single file (<name>.md)",
+        importTitle: "Import a SKILL.md",
+        importNote:
+          "Paste a complete SKILL.md (frontmatter and body): it is parsed with the same rules as a file on disk, written only after it validates, and unknown frontmatter keys are preserved.",
+        importText: "SKILL.md content",
+        importTextHint: "The first line must be exactly ---, then the frontmatter, then a closing ---; the body follows.",
+        importName: "Skill name (optional)",
+        importNameHint: "Leave it empty to use the frontmatter name; fill it in to save under a new name and rewrite the frontmatter.",
+        importEmpty: "Paste the SKILL.md content first.",
       },
       validate: {
         ok: "The definition is valid.",
@@ -292,6 +325,8 @@ window.__ModuleLoader__.load({
         started: "{name} enabled.",
         stopped: "{name} disabled.",
         refreshed: "The skill root was re-scanned.",
+        imported: "Imported skill {name}.",
+        discarded: "Deleted the unreadable entry {name}.",
       },
       error: {
         noConnection: "The browser connection service is unavailable.",
@@ -363,6 +398,9 @@ window.__ModuleLoader__.load({
 .dsh-skm-issues { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--dsw-alias-state-warn-primary); background: var(--dsw-alias-bg-layer-1); }
 .dsh-skm-issue-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow: auto; }
 .dsh-skm-issue-list li { overflow-wrap: anywhere; }
+.dsh-skm-issue-row { display: flex; align-items: flex-start; gap: 8px; }
+.dsh-skm-issue-text { flex: 1 1 auto; min-width: 0; }
+.dsh-skm-issue-row .dsh-skm-btn { flex: 0 0 auto; }
 .dsh-skm-issue-list code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 .dsh-skm-validate { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
 .dsh-skm-preview { margin: 0; padding: 8px; border-radius: 6px; background: var(--dsw-alias-bg-layer-2); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; line-height: 1.45; max-height: 180px; overflow: auto; white-space: pre-wrap; }
@@ -483,6 +521,85 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Whether the page is currently in a hidden tab.
+     *
+     * A hidden settings page has nobody reading it, so its poll would cost a
+     * full directory scan on the host for no visible benefit. The timer keeps
+     * running and skips the request; becoming visible loads immediately.
+     * @returns true when `document` reports a hidden page.
+     */
+    function isPageHidden() {
+      return typeof document !== "undefined" && document.visibilityState === "hidden";
+    }
+
+    /**
+     * A cheap identity for "the catalog the user is looking at".
+     *
+     * The page polls every eight seconds; replacing the snapshot state with an
+     * equal-but-new object re-renders every card. This FNV-1a digest covers the
+     * fields a card renders, so an unchanged catalog leaves React alone while a
+     * real edit (including an external one, which bumps `updatedAt`) still lands.
+     * @param snapshot - catalog snapshot from any host version.
+     * @returns a short signature string; equal signatures mean "nothing to redraw".
+     */
+    function snapshotSignature(snapshot) {
+      if (snapshot === null || snapshot === undefined) return "";
+      let hash = 2166136261;
+      const mix = (value) => {
+        const text = String(value ?? "");
+        for (let index = 0; index < text.length; index += 1) {
+          hash ^= text.charCodeAt(index);
+          hash = Math.imul(hash, 16777619);
+        }
+        hash ^= 10;
+        hash = Math.imul(hash, 16777619);
+      };
+      const skills = Array.isArray(snapshot.skills) ? snapshot.skills : [];
+      const issues = Array.isArray(snapshot.issues) ? snapshot.issues : [];
+      mix(snapshot.generation);
+      mix(snapshot.version);
+      mix(skillRootOf(snapshot));
+      mix(snapshot.channel === undefined || snapshot.channel === null ? "" : snapshot.channel.state);
+      mix(skills.length);
+      mix(issues.length);
+      for (const skill of skills) {
+        mix(skill.path);
+        mix(skill.name);
+        mix(skill.status);
+        mix(skill.updatedAt);
+        mix(skill.description);
+        mix(skill.whenToUse);
+        mix(skill.invocation === undefined || skill.invocation === null ? "" : `${skill.invocation.modelInvocable}${skill.invocation.userInvocable}`);
+        mix(Array.isArray(skill.warnings) ? skill.warnings.length : 0);
+      }
+      for (const issue of issues) {
+        mix(issue.path);
+        mix(issue.message);
+      }
+      return `${skills.length}:${issues.length}:${hash >>> 0}`;
+    }
+
+    /**
+     * Insert one cached body and keep the cache bounded.
+     *
+     * Only opened cards are cached, but a long session over a large catalog would
+     * still grow without limit; the oldest entries are dropped, never the one the
+     * caller is inserting.
+     * @param cache - current `path -> body entry` map.
+     * @param path - the skill path being stored.
+     * @param entry - body state for that path.
+     * @returns the next cache.
+     */
+    function withBodyEntry(cache, path, entry) {
+      const next = { ...cache, [path]: entry };
+      const keys = Object.keys(next);
+      for (const key of keys.slice(0, Math.max(0, keys.length - BODY_CACHE_LIMIT))) {
+        if (key !== path) delete next[key];
+      }
+      return next;
+    }
+
+    /**
      * The rows this page should render.
      *
      * The current host already enforces both invariants, but the page can be
@@ -580,6 +697,14 @@ window.__ModuleLoader__.load({
         userInvocable: true,
         body: "",
       };
+    }
+
+    /**
+     * Empty draft for an import.
+     * @returns `{ text, name, layout }` for {@link ImportForm}.
+     */
+    function emptyImportDraft() {
+      return { text: "", name: "", layout: "bundle" };
     }
 
     /**
@@ -976,13 +1101,85 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Import a whole `SKILL.md` from pasted text.
+     *
+     * The form next door edits fields one at a time; this one is the paste path
+     * for a skill copied from a chat, a gist, or another machine. Parsing and
+     * validation happen on the host with the same rules as a file on disk, so an
+     * import cannot create something the provider would ignore.
+     */
+    function ImportForm(props) {
+      const { t, rootPath, initial, onCancel, onSubmit } = props;
+      const [draft, setDraft] = useState(() => initial);
+      const [problem, setProblem] = useState("");
+
+      const update = useCallback((patch) => {
+        setDraft((current) => ({ ...current, ...patch }));
+      }, []);
+
+      const submit = useCallback(() => {
+        if (String(draft.text ?? "").trim() === "") {
+          setProblem(t("form.importEmpty"));
+          return;
+        }
+        setProblem("");
+        onSubmit({
+          text: String(draft.text ?? ""),
+          name: String(draft.name ?? "").trim(),
+          layout: draft.layout === "file" ? "file" : "bundle",
+        });
+      }, [draft, onSubmit, t]);
+
+      return h(
+        "div",
+        { className: "dsh-skm-form" },
+        h("div", { className: "dsh-skm-title" }, t("form.importTitle")),
+        h("div", { className: "dsh-skm-subtitle" }, t("form.importNote")),
+        h("div", { className: "dsh-skm-subtitle" }, fill(t("form.rootNote"), { path: rootPath === "" ? "—" : rootPath })),
+        problem === "" ? null : h("div", { className: "dsh-skm-banner error" }, problem),
+        h(
+          Field,
+          { label: t("form.importText"), hint: t("form.importTextHint") },
+          h("textarea", {
+            className: "body",
+            value: draft.text,
+            onChange: (event) => update({ text: event.target.value }),
+          }),
+        ),
+        h(
+          Field,
+          { label: t("form.importName"), hint: t("form.importNameHint") },
+          h("input", { type: "text", value: draft.name, onChange: (event) => update({ name: event.target.value }) }),
+        ),
+        h(
+          Field,
+          { label: t("field.layout"), hint: t("field.layoutHint") },
+          h(
+            "select",
+            { value: draft.layout, onChange: (event) => update({ layout: event.target.value }) },
+            h("option", { value: "bundle" }, t("form.bundle")),
+            h("option", { value: "file" }, t("form.file")),
+          ),
+        ),
+        h(
+          "div",
+          { className: "dsh-skm-bar" },
+          h("button", { type: "button", className: "dsh-skm-btn primary", onClick: submit }, t("save")),
+          h("button", { type: "button", className: "dsh-skm-btn ghost", onClick: onCancel }, t("cancel")),
+        ),
+      );
+    }
+
+    /**
      * The handful of files that look like skills but cannot be parsed.
      *
      * They are invisible to the model, so this panel is the only place a user
-     * learns why a file they wrote does nothing.
+     * learns why a file they wrote does nothing — and the only place it can be
+     * deleted again, because the page could not offer an edit form for a file it
+     * cannot parse.
      */
     function IssuesPanel(props) {
-      const { t, issues, open, onToggle } = props;
+      const { t, issues, open, onToggle, onDiscard } = props;
       if (!Array.isArray(issues) || issues.length === 0) return null;
       return h(
         "div",
@@ -1005,10 +1202,21 @@ window.__ModuleLoader__.load({
               issues.map((issue, index) =>
                 h(
                   "li",
-                  { key: index },
-                  h("code", null, String(issue.path ?? "")),
-                  " — ",
-                  String(issue.message ?? ""),
+                  { key: index, className: "dsh-skm-issue-row" },
+                  h(
+                    "div",
+                    { className: "dsh-skm-issue-text" },
+                    h("code", null, String(issue.path ?? "")),
+                    " — ",
+                    String(issue.message ?? ""),
+                  ),
+                  typeof onDiscard === "function"
+                    ? h(
+                        "button",
+                        { type: "button", className: "dsh-skm-btn danger", onClick: () => onDiscard(issue) },
+                        t("discard"),
+                      )
+                    : null,
                 ),
               ),
             )
@@ -1031,7 +1239,7 @@ window.__ModuleLoader__.load({
       const [search, setSearch] = useState("");
       const [filter, setFilter] = useState("all");
       const [issuesOpen, setIssuesOpen] = useState(false);
-      const generationRef = useRef(0);
+      const signatureRef = useRef("");
       const noticeTimer = useRef(null);
       const [clock, setClock] = useState(() => Date.now());
 
@@ -1069,27 +1277,57 @@ window.__ModuleLoader__.load({
         [],
       );
 
+      const applySnapshot = useCallback((next, clock) => {
+        const signature = snapshotSignature(next);
+        if (signature === signatureRef.current) return false;
+        signatureRef.current = signature;
+        setSnapshot(next);
+        setClock(clock);
+        return true;
+      }, []);
+
       const load = useCallback(async () => {
         try {
           const next = await call("state", {});
-          setSnapshot(next);
-          setClock(Date.now());
-          generationRef.current = next.generation;
+          /*
+           * A poll that returns the catalog already on screen must not touch
+           * state: replacing the snapshot object re-renders every card twice a
+           * minute for nothing.
+           */
+          applySnapshot(next, Date.now());
           setError("");
           return next;
         } catch (failure) {
           setError(String((failure && failure.message) || failure));
           return null;
         }
-      }, [call]);
+      }, [applySnapshot, call]);
 
       useEffect(() => {
         void load();
+        /*
+         * A hidden tab keeps polling out of politeness today, which costs the
+         * host a directory scan nobody can see. Skip the request while hidden and
+         * load as soon as the page is visible again.
+         */
         const timer = setInterval(() => {
-          void load();
+          if (!isPageHidden()) void load();
         }, POLL_MS);
+        const clockTimer = setInterval(() => {
+          if (!isPageHidden()) setClock(Date.now());
+        }, CLOCK_MS);
+        const onVisibility = () => {
+          if (!isPageHidden()) void load();
+        };
+        if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+          document.addEventListener("visibilitychange", onVisibility);
+        }
         return () => {
           clearInterval(timer);
+          clearInterval(clockTimer);
+          if (typeof document !== "undefined" && typeof document.removeEventListener === "function") {
+            document.removeEventListener("visibilitychange", onVisibility);
+          }
         };
       }, [load]);
 
@@ -1101,12 +1339,13 @@ window.__ModuleLoader__.load({
           return Promise.resolve()
             .then(() => call(endpoint, payload))
             .then((value) => {
-              if (value && value.snapshot) setSnapshot(value.snapshot);
-              if (value && typeof value.generation === "number") generationRef.current = value.generation;
+              if (value && value.snapshot) applySnapshot(value.snapshot, Date.now());
               setBodies({});
               setBodyOpen("");
               setEditor(null);
-              showNotice(message);
+              // An import only learns its final name from the receipt, so a
+              // message may be a function of the response.
+              showNotice(typeof message === "function" ? message(value) : message);
               return value;
             })
             .catch((failure) => {
@@ -1114,26 +1353,24 @@ window.__ModuleLoader__.load({
             })
             .finally(() => setBusy(""));
         },
-        [call, dismissNotice, showNotice],
+        [applySnapshot, call, dismissNotice, showNotice],
       );
 
       const loadBody = useCallback(
         (skill) => {
           const path = String(skill.path ?? "");
           if (path === "") return;
-          setBodies((current) => ({ ...current, [path]: { loading: true, text: "", error: "" } }));
+          setBodies((current) => withBodyEntry(current, path, { loading: true, text: "", error: "" }));
           void call("get", { path })
-            .then((value) =>
-              setBodies((current) => ({
-                ...current,
-                [path]: { loading: false, text: String(value.body ?? ""), error: "" },
-              })),
-            )
+            .then((value) => setBodies((current) => withBodyEntry(current, path, { loading: false, text: String(value.body ?? ""), error: "" })))
             .catch((failure) =>
-              setBodies((current) => ({
-                ...current,
-                [path]: { loading: false, text: "", error: `${t("error.bodyLoad")}: ${String((failure && failure.message) || failure)}` },
-              })),
+              setBodies((current) =>
+                withBodyEntry(current, path, {
+                  loading: false,
+                  text: "",
+                  error: `${t("error.bodyLoad")}: ${String((failure && failure.message) || failure)}`,
+                }),
+              ),
             );
         },
         [call, t],
@@ -1143,6 +1380,10 @@ window.__ModuleLoader__.load({
         (mode, skill) => {
           if (mode === "create") {
             setEditor({ mode, skill: null, initial: emptyDraft() });
+            return;
+          }
+          if (mode === "import") {
+            setEditor({ mode, skill: null, initial: emptyImportDraft() });
             return;
           }
           setBusy("get");
@@ -1188,6 +1429,23 @@ window.__ModuleLoader__.load({
         [mutate, t],
       );
 
+      const onDiscardIssue = useCallback(
+        (issue) => {
+          const path = String(issue.path ?? "");
+          if (path === "") return;
+          if (typeof window !== "undefined" && !window.confirm(fill(t("confirmDiscard"), { path }))) return;
+          mutate("discard", { path }, fill(t("notice.discarded"), { name: path }));
+        },
+        [mutate, t],
+      );
+
+      const onImport = useCallback(
+        (payload) => {
+          mutate("import", payload, (value) => fill(t("notice.imported"), { name: String((value && value.name) || payload.name || "") }));
+        },
+        [mutate, t],
+      );
+
       const onRefresh = useCallback(() => {
         setBusy("refresh");
         setError("");
@@ -1195,12 +1453,12 @@ window.__ModuleLoader__.load({
         void Promise.resolve()
           .then(() => call("refresh", {}))
           .then((next) => {
-            if (next && Array.isArray(next.skills)) setSnapshot(next);
+            if (next && Array.isArray(next.skills)) applySnapshot(next, Date.now());
             showNotice(t("notice.refreshed"));
           })
           .catch((failure) => setError(String((failure && failure.message) || failure)))
           .finally(() => setBusy(""));
-      }, [call, dismissNotice, showNotice, t]);
+      }, [applySnapshot, call, dismissNotice, showNotice, t]);
 
       const onSubmitDraft = useCallback(
         (definition) => {
@@ -1271,6 +1529,19 @@ window.__ModuleLoader__.load({
             "button",
             {
               type: "button",
+              className: "dsh-skm-btn",
+              disabled: busy !== "" || editor !== null,
+              onClick: () => {
+                dismissNotice();
+                openEditor("import", null);
+              },
+            },
+            t("importSkill"),
+          ),
+          h(
+            "button",
+            {
+              type: "button",
               className: "dsh-skm-btn primary",
               disabled: busy !== "" || editor !== null,
               onClick: () => {
@@ -1284,7 +1555,7 @@ window.__ModuleLoader__.load({
         error === "" ? null : h("div", { className: "dsh-skm-banner error" }, error),
         notice === "" ? null : h("div", { className: "dsh-skm-banner" }, notice),
         legacyHost ? h("div", { className: "dsh-skm-banner warn" }, fill(t("legacyHost"), { version })) : null,
-        h(IssuesPanel, { t, issues, open: issuesOpen, onToggle: () => setIssuesOpen((current) => !current) }),
+        h(IssuesPanel, { t, issues, open: issuesOpen, onToggle: () => setIssuesOpen((current) => !current), onDiscard: onDiscardIssue }),
         h(
           "div",
           { className: "dsh-skm-bar" },
@@ -1310,17 +1581,26 @@ window.__ModuleLoader__.load({
         ),
         editor === null
           ? null
-          : h(SkillForm, {
-              key: editorKey(editor),
-              t,
-              mode: editor.mode,
-              original: editor.skill,
-              rootPath,
-              initial: editor.initial,
-              onCancel: () => setEditor(null),
-              onSubmit: onSubmitDraft,
-              onValidate: onValidateDraft,
-            }),
+          : editor.mode === "import"
+            ? h(ImportForm, {
+                key: editorKey(editor),
+                t,
+                rootPath,
+                initial: editor.initial,
+                onCancel: () => setEditor(null),
+                onSubmit: onImport,
+              })
+            : h(SkillForm, {
+                key: editorKey(editor),
+                t,
+                mode: editor.mode,
+                original: editor.skill,
+                rootPath,
+                initial: editor.initial,
+                onCancel: () => setEditor(null),
+                onSubmit: onSubmitDraft,
+                onValidate: onValidateDraft,
+              }),
         allSkills.length === 0
           ? h(
               "div",
@@ -1393,10 +1673,16 @@ window.__ModuleLoader__.load({
       const t = makeTranslator(ctx);
       const connection = ctx.get("connection");
       const call = async (endpoint, payload) => {
-        if (connection === undefined || connection === null) throw new Error(t("error.noConnection"));
+        /*
+         * Resolve the service per request: the connection half can be reloaded
+         * while this page stays open, and a captured instance would then be a
+         * disposed service whose calls fail until the page is refreshed.
+         */
+        const live = ctx.get("connection") ?? connection;
+        if (live === undefined || live === null) throw new Error(t("error.noConnection"));
         let result;
         try {
-          result = await connection.rpc.call(CHANNEL, endpoint, payload ?? {});
+          result = await live.rpc.call(CHANNEL, endpoint, payload ?? {});
         } catch (failure) {
           throw new Error(`${t("error.transport")}: ${String((failure && failure.message) || failure)}`);
         }
@@ -1425,13 +1711,14 @@ window.__ModuleLoader__.load({
     exports.apply = apply;
     exports.inject = inject;
     /** Offline authoring surface: `test/check-client.mjs` renders these without a browser. */
-    exports.__components = { SkillsSection, SkillCard, SkillForm, IssuesPanel, Field };
+    exports.__components = { SkillsSection, SkillCard, SkillForm, ImportForm, IssuesPanel, Field };
     /** Pure helpers the offline check asserts directly. */
     exports.__helpers = {
       saveAction,
       definitionFromDraft,
       draftFromSkill,
       emptyDraft,
+      emptyImportDraft,
       draftProblem,
       filterSkills,
       formatAgo,
@@ -1442,6 +1729,9 @@ window.__ModuleLoader__.load({
       editorKey,
       removePrompt,
       fill,
+      snapshotSignature,
+      withBodyEntry,
+      isPageHidden,
     };
     exports.__dictionaries = { zh, en };
     return module.exports;

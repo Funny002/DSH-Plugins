@@ -5,8 +5,8 @@
  *
  *   node test/check-host.mjs
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const scanner = await import(new URL('../lib/scanner.js', import.meta.url).href)
@@ -236,6 +236,175 @@ check('findRow rejects an unknown path', findThrew)
   check('config keeps the dshHome override', config.dshHome === 'C:/custom-home')
   const empty = index.Config({})
   check('config defaults dshHome to empty', empty.dshHome === '')
+}
+
+// ── malformed files carry an actionable diagnosis ──────────────────────────
+{
+  const brokenRoot = join(temporary, 'broken-root')
+  mkdirSync(brokenRoot, { recursive: true })
+  // A UTF-8 BOM is invisible in an editor and makes the provider skip the file;
+  // the message must name the byte instead of blaming a missing frontmatter.
+  writeFileSync(join(brokenRoot, 'bom.md'), `\uFEFF---\nname: bom-skill\ndescription: x\n---\n\nBody.\n`, 'utf8')
+  mkdirSync(join(brokenRoot, 'huge'), { recursive: true })
+  writeFileSync(
+    join(brokenRoot, 'huge', 'SKILL.md'),
+    `---\nname: huge-skill\ndescription: x\n---\n\n${'x'.repeat(scanner.MAX_SKILL_FILE_BYTES + 1)}`,
+    'utf8',
+  )
+  writeFileSync(join(brokenRoot, 'upper.MD'), SKILL('name: upper-skill\ndescription: Upper extension.'))
+  const brokenScan = scanner.scanRoot({ path: brokenRoot, skipSystem: true })
+  const bomIssue = brokenScan.issues.find((issue) => issue.path.endsWith('bom.md'))
+  check('a BOM is diagnosed as a BOM', bomIssue !== undefined && bomIssue.message.includes('BOM'), bomIssue?.message)
+  check('a BOM is not reported as missing frontmatter', bomIssue === undefined || !bomIssue.message.includes('缺少'))
+  const hugeIssue = brokenScan.issues.find((issue) => issue.path.endsWith(join('huge', 'SKILL.md')))
+  check('an oversized file is skipped with the limit in the message', hugeIssue !== undefined && hugeIssue.message.includes('过大'), hugeIssue?.message)
+  const upper = brokenScan.skills.find((skill) => skill.name === 'upper-skill')
+  check('an upper-case .MD file is still listed', upper !== undefined)
+  check('an upper-case .MD file warns that the provider skips it', upper?.warnings.some((warning) => warning.includes('.md')), String(upper?.warnings))
+}
+
+// ── one file is one skill, even through a link ─────────────────────────────
+{
+  const linkRoot = join(temporary, 'link-root')
+  write(join(linkRoot, 'real', 'SKILL.md'), SKILL('name: linked\ndescription: Only one file.'))
+  let linked = true
+  try {
+    // A directory junction needs no elevation on Windows and is a symlink
+    // elsewhere; both make the same instruction file reachable twice. The
+    // identity test uses the real path, so the alias must not become a row.
+    symlinkSync(join(linkRoot, 'real'), join(linkRoot, 'alias'), process.platform === 'win32' ? 'junction' : 'dir')
+  } catch {
+    linked = false
+  }
+  const linkScan = scanner.scanRoot({ path: linkRoot, skipSystem: true })
+  const linkRows = scanner.resolveCatalog(linkScan.skills)
+  if (linked) {
+    check('a link alias collapses onto one row', linkRows.length === 1, String(linkRows.length))
+    check('the surviving link row is active', linkRows[0]?.status === 'active')
+    check('a row records its real path', typeof linkRows[0]?.realPath === 'string' && linkRows[0].realPath.includes('real'))
+  } else {
+    console.log('note: links are unavailable here, skipped the link-alias check')
+    check('without a link there is exactly one row', linkRows.length === 1, String(linkRows.length))
+  }
+}
+
+// ── atomic writes: containment, no clobber, no debris ──────────────────────
+{
+  const writeRoot = join(temporary, 'write-root')
+  mkdirSync(writeRoot, { recursive: true })
+  const inside = join(writeRoot, 'atomic', 'SKILL.md')
+  scanner.writeSkillFile(inside, SKILL('name: atomic\ndescription: x'), { root: writeRoot })
+  check('a contained write lands', scanner.readSkillFile(inside).name === 'atomic')
+  const debris = scanner.scanRoot({ path: writeRoot, skipSystem: true }).issues
+  check('a write leaves no temporary file behind', debris.length === 0, JSON.stringify(debris))
+  let refused = ''
+  try {
+    scanner.writeSkillFile(join(temporary, 'outside', 'SKILL.md'), SKILL('name: escape\ndescription: x'), { root: writeRoot })
+  } catch (error) {
+    refused = String(error.message)
+  }
+  check('a write outside the root is refused', refused.includes('根目录之外'), refused)
+  let clobbered = ''
+  try {
+    scanner.writeSkillFile(inside, SKILL('name: atomic\ndescription: replaced'), { root: writeRoot, exclusive: true })
+  } catch (error) {
+    clobbered = String(error.message)
+  }
+  check('an exclusive write refuses an existing file', clobbered.includes('无法写入技能文件'), clobbered)
+  check('the existing file survived the refused write', scanner.readSkillFile(inside).description === 'x')
+  check('the write error keeps its code', (() => {
+    try {
+      scanner.writeSkillFile(inside, SKILL('name: atomic\ndescription: y'), { root: writeRoot, exclusive: true })
+      return false
+    } catch (error) {
+      return error.code === 'EEXIST'
+    }
+  })())
+}
+
+// ── importing text uses the same parser as a file on disk ──────────────────
+{
+  const text = SKILL('name: imported\ndescription: Pasted.\nlicense: MIT')
+  const parsed = scanner.parseSkillText(text)
+  check('parseSkillText accepts a valid SKILL.md', parsed.name === 'imported' && parsed.data.license === 'MIT')
+  check('parseSkillText keeps the raw text', parsed.raw === text)
+  check('parseSkillText trims the body', parsed.body === '# Instructions\n\nDo the thing.')
+  let message = ''
+  try {
+    scanner.parseSkillText('\uFEFF' + text)
+  } catch (error) {
+    message = String(error.message)
+  }
+  check('parseSkillText rejects a BOM', message.includes('BOM'), message)
+  message = ''
+  try {
+    scanner.parseSkillText('not a skill')
+  } catch (error) {
+    message = String(error.message)
+  }
+  check('parseSkillText rejects a missing frontmatter', message.includes('frontmatter'), message)
+  message = ''
+  try {
+    scanner.parseSkillText(42)
+  } catch (error) {
+    message = String(error.message)
+  }
+  check('parseSkillText rejects a non-string', message.includes('文本'), message)
+  message = ''
+  try {
+    scanner.parseSkillText(`---\nname: legacy\ndescription: x\ndisableModelInvocation: true\n---\n\nbody\n`)
+  } catch (error) {
+    message = String(error.message)
+  }
+  check('parseSkillText rejects a legacy invocation key', message.includes('disable-model-invocation'), message)
+  message = ''
+  try {
+    scanner.parseSkillText(`---\nname: big\ndescription: x\n---\n\n${'x'.repeat(scanner.MAX_SKILL_FILE_BYTES)}`)
+  } catch (error) {
+    message = String(error.message)
+  }
+  check('parseSkillText caps the size', message.includes('过大'), message)
+  // The body cap is the file cap minus frontmatter headroom, so a saved body can
+  // always be read back by the same plugin.
+  const bodyLimit = scanner.MAX_SKILL_FILE_BYTES - 16384
+  const body = scanner.normalizeDefinition({ name: 'big-body', description: 'x', body: 'x'.repeat(bodyLimit) })
+  check('normalize accepts a body at the cap', body.body.length === bodyLimit)
+  message = ''
+  try {
+    scanner.normalizeDefinition({ name: 'too-big', description: 'x', body: 'x'.repeat(bodyLimit + 1) })
+  } catch (error) {
+    message = String(error.message)
+  }
+  check('normalize refuses a body over the cap', message.includes('正文过大'), message)
+}
+
+// ── the scan cache is used but never hides an edit ────────────────────────
+{
+  const cacheRoot = join(temporary, 'cache-root')
+  mkdirSync(cacheRoot, { recursive: true })
+  const path = join(cacheRoot, 'cached', 'SKILL.md')
+  scanner.writeSkillFile(path, SKILL('name: cached\ndescription: First value.'), { root: cacheRoot })
+  const first = scanner.scanRoot({ path: cacheRoot, skipSystem: true })
+  const second = scanner.scanRoot({ path: cacheRoot, skipSystem: true })
+  check('a repeated scan lists the same skill', first.skills.length === 1 && second.skills.length === 1)
+  check('a repeated scan reports the same header', second.skills[0].description === 'First value.' && second.skills[0].bodyBytes === first.skills[0].bodyBytes)
+  // Same byte length, different content: the cache must not serve the old parse.
+  scanner.writeSkillFile(path, SKILL('name: cached\ndescription: Other value.'), { root: cacheRoot })
+  const third = scanner.scanRoot({ path: cacheRoot, skipSystem: true })
+  check('a rewrite is not served from the cache', third.skills[0].description === 'Other value.', third.skills[0].description)
+  scanner.forgetSkillHeader(path)
+  check('forgetSkillHeader is callable for an unknown path', scanner.forgetSkillHeader(join(cacheRoot, 'nope', 'SKILL.md')) === undefined)
+  check('an external edit lands without a cache drop', (() => {
+    writeFileSync(path, SKILL('name: cached\ndescription: Edited on disk.'), 'utf8')
+    return scanner.scanRoot({ path: cacheRoot, skipSystem: true }).skills[0].description === 'Edited on disk.'
+  })())
+  rmSync(cacheRoot, { recursive: true, force: true })
+}
+
+// ── home expansion is reachable through the resolver ──────────────────────
+{
+  const expanded = scanner.resolveDshHome('~/skills-home', {})
+  check('a leading ~ expands to the OS home', expanded === join(homedir(), 'skills-home'), expanded)
 }
 
 // ── wrap up ────────────────────────────────────────────────────────────────

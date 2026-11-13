@@ -178,6 +178,29 @@ function hasProp(node, property, value) {
   return hasProp(node.props?.children, property, value)
 }
 
+/** The first element matching a predicate, expanding function components once. */
+function findElement(node, predicate) {
+  if (node === null || node === undefined || typeof node !== 'object') return null
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findElement(child, predicate)
+      if (found !== null) return found
+    }
+    return null
+  }
+  if (typeof node.type === 'function') {
+    let rendered
+    try {
+      rendered = withHooks(() => node.type(node.props))
+    } catch {
+      return null
+    }
+    return findElement(rendered, predicate)
+  }
+  if (predicate(node)) return node
+  return findElement(node.props?.children, predicate)
+}
+
 const strictT = (key) => {
   const value = lookupKey(plugin.__dictionaries.zh, key)
   if (typeof value !== 'string') throw new Error(`missing translation for ${key}`)
@@ -429,6 +452,45 @@ check('no markup text is NaN', !pageText.includes('NaN'))
   check('the issues panel names the file', issuesText.includes('C:/Users/x/.dsh/skills/broken/SKILL.md'))
   check('the issues panel explains the problem', issuesText.includes('缺少 YAML frontmatter'))
   check('the issues panel collapses', textOf(await mount(plugin.__components.IssuesPanel, { t: strictT, issues: snapshot.issues, open: false, onToggle: () => {} })).includes('查看'))
+  check('the issues panel offers no discard without a handler', !issuesText.includes('删除'))
+}
+{
+  // A malformed file has no editor, so deleting it is the only way out of the
+  // panel; the action must be present when the section passes its handler.
+  let discarded = null
+  const issues = await mount(plugin.__components.IssuesPanel, {
+    t: strictT,
+    issues: snapshot.issues,
+    open: true,
+    onToggle: () => {},
+    onDiscard: (issue) => {
+      discarded = issue.path
+    },
+  })
+  check('the issues panel offers a discard action', textOf(issues).includes('删除'))
+  const button = findElement(issues, (node) => node.type === 'button' && node.props.children === '删除')
+  check('the discard action is a button', button !== null)
+  if (button !== null) button.props.onClick()
+  check('the discard action names the file', discarded === snapshot.issues[0].path, String(discarded))
+}
+
+// ── the import form ────────────────────────────────────────────────────────
+{
+  const form = await mount(plugin.__components.ImportForm, {
+    t: strictT,
+    rootPath,
+    initial: plugin.__helpers.emptyImportDraft(),
+    onCancel: () => {},
+    onSubmit: () => {},
+  })
+  const text = textOf(form)
+  check('the import form has its title', text.includes('导入 SKILL.md'))
+  check('the import form explains what to paste', text.includes('frontmatter'))
+  check('the import form names the single root', text.includes('写入技能根目录') && text.includes(rootPath))
+  check('the import form offers both layouts', text.includes('目录（<名称>/SKILL.md）') && text.includes('单文件（<名称>.md）'))
+  check('the import form has the actions', text.includes('保存') && text.includes('取消'))
+  check('a page without an editor shows no import form', !textOf(page).includes('导入 SKILL.md'))
+  check('the page offers the import action', pageText.includes('导入'))
 }
 
 // ── pure helpers ───────────────────────────────────────────────────────────
@@ -478,6 +540,40 @@ check('no markup text is NaN', !pageText.includes('NaN'))
   check('editorKey handles no editor', helpers.editorKey(null) === 'none')
   check('a bundle removal prompt names the directory', helpers.removePrompt(strictT, snapshot.skills[0]).includes('C:/Users/x/.dsh/skills/code-review'))
   check('a file removal prompt names the file', helpers.removePrompt(strictT, snapshot.skills[1]).includes('C:/Users/x/.dsh/skills/commit-message.md'))
+}
+
+// ── polling and rendering economy ─────────────────────────────────────────
+{
+  const helpers = plugin.__helpers
+  const base = helpers.snapshotSignature(snapshot)
+  check('a signature is stable for the same snapshot', helpers.snapshotSignature({ ...snapshot }) === base)
+  check('a signature is empty without a snapshot', helpers.snapshotSignature(null) === '')
+  const edited = {
+    ...snapshot,
+    skills: snapshot.skills.map((skill) => (skill.name === 'code-review' ? { ...skill, updatedAt: skill.updatedAt + 1 } : skill)),
+  }
+  check('an external edit changes the signature', helpers.snapshotSignature(edited) !== base)
+  const renamed = { ...snapshot, skills: snapshot.skills.map((skill) => (skill.name === 'code-review-old' ? { ...skill, name: 'code-review-older' } : skill)) }
+  check('a renamed skill changes the signature', helpers.snapshotSignature(renamed) !== base)
+  const shadowToggled = {
+    ...snapshot,
+    skills: snapshot.skills.map((skill) => (skill.name === 'code-review-old' ? { ...skill, status: 'active' } : skill)),
+  }
+  check('a status change changes the signature', helpers.snapshotSignature(shadowToggled) !== base)
+  const issueChanged = { ...snapshot, issues: [...snapshot.issues, { path: 'C:/tmp/x.md', message: 'new' }] }
+  check('a new issue changes the signature', helpers.snapshotSignature(issueChanged) !== base)
+  check('a signature ignores fields no card renders', helpers.snapshotSignature({ ...snapshot, totals: { ...snapshot.totals, skills: 99 } }) === base)
+
+  let cache = {}
+  for (let index = 0; index < 40; index += 1) cache = helpers.withBodyEntry(cache, `C:/skill-${index}.md`, { loading: false, text: 'x', error: '' })
+  check('the body cache is bounded', Object.keys(cache).length === 32, String(Object.keys(cache).length))
+  check('the body cache keeps the newest entry', cache['C:/skill-39.md'] !== undefined)
+  check('the body cache drops the oldest entry', cache['C:/skill-0.md'] === undefined)
+  check('the body cache keeps every distinct path', helpers.withBodyEntry({}, 'a', { text: 'a' }).a.text === 'a')
+  check('a page outside a browser is never hidden', helpers.isPageHidden() === false)
+  const importDraft = helpers.emptyImportDraft()
+  check('an import draft starts empty', importDraft.text === '' && importDraft.name === '' && importDraft.layout === 'bundle')
+  check('an import draft carries no body field', !Object.hasOwn(importDraft, 'body'))
 }
 
 if (failures.length > 0) {
