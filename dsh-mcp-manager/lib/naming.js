@@ -170,11 +170,11 @@ export function contentToText(content, rawName) {
 }
 
 /**
- * Render a thrown value as one diagnostic line.
+ * Render one thrown value as text, without following its `cause` chain.
  * @param error - rejected value.
  * @returns the message text.
  */
-export function errorMessage(error) {
+function ownMessage(error) {
   if (error instanceof Error) return error.message
   if (typeof error === 'string') return error
   try {
@@ -182,4 +182,24 @@ export function errorMessage(error) {
   } catch {
     return String(error)
   }
+}
+
+/**
+ * Render a thrown value as one diagnostic line, keeping the cause.
+ *
+ * `fetch failed` is the canonical case: the useful part (`ECONNREFUSED`, a TLS
+ * code, a proxy failure) lives on `error.cause`, so dropping it leaves the
+ * settings page with an error nobody can act on. Node's fetch and the MCP SDK
+ * both use `cause`, hence the one-level unwind below.
+ *
+ * @param error - rejected value.
+ * @returns the message text, with at most one cause level appended.
+ */
+export function errorMessage(error) {
+  const message = ownMessage(error)
+  const cause = error instanceof Error ? error.cause : undefined
+  if (cause === undefined || cause === null || cause === error) return message
+  const causeText = ownMessage(cause)
+  if (causeText === '' || causeText === message || message.includes(causeText)) return message
+  return `${message}: ${causeText}`
 }

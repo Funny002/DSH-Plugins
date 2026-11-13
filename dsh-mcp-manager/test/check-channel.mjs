@@ -67,6 +67,44 @@ check('traversal is ignored', endpointFromPath('/mcp-manager', '/mcp-manager/../
   check('unauthenticated request is 401', response.status === 401 && response.body === 'unauthorized')
 }
 
+// A rejection function that itself throws must still produce a response.
+{
+  const response = makeResponse()
+  await serveChannelRequest(
+    {
+      channel: '/mcp-manager',
+      connection: {
+        requestRejection: () => {
+          throw new Error('cookie store unavailable')
+        },
+      },
+      dispatch,
+    },
+    makeRequest(),
+    response,
+  )
+  check('a throwing trust fence becomes a 500', response.status === 500 && response.body === 'internal error', String(response.status))
+}
+
+// A client that disconnects mid-upload must not leave the handler pending.
+{
+  const request = new EventEmitter()
+  request.method = 'POST'
+  request.url = '/mcp-manager/state'
+  request.headers = { 'content-type': 'application/json' }
+  request.destroy = () => {}
+  setImmediate(() => {
+    request.emit('aborted')
+  })
+  const response = makeResponse()
+  const settled = await Promise.race([
+    serveChannelRequest({ channel: '/mcp-manager', connection, dispatch }, request, response).then(() => 'settled'),
+    new Promise((resolve) => setTimeout(() => resolve('hung'), 1000)),
+  ])
+  check('an aborted upload settles', settled === 'settled')
+  check('an aborted upload is a 400', response.status === 400, String(response.status))
+}
+
 // ── transport-level branches ────────────────────────────────────────────────
 for (const [label, options, status] of [
   ['GET is 404', { method: 'GET' }, 404],
@@ -115,6 +153,18 @@ for (const [label, options, status] of [
   check('dispatch failure is a 200 failure branch', response.status === 200 && parsed.result.ok === false)
   check('dispatch failure names the endpoint', parsed.result.error.code === 'mcp-manager/boom' && parsed.result.error.message === 'dispatch exploded')
   check('dispatch failure details are an object', typeof parsed.result.error.details === 'object')
+}
+{
+  // The state endpoint's payload is forwarded verbatim, so an old browser that
+  // sends `{}` and a new one that sends `{ includeTools: false }` both work.
+  const response = makeResponse()
+  await serveChannelRequest(
+    { channel: '/mcp-manager', connection, dispatch },
+    makeRequest({ body: envelope('r6', 'state', { includeTools: false }) }),
+    response,
+  )
+  const parsed = JSON.parse(response.body)
+  check('the payload reaches dispatch', parsed.result.ok === true && parsed.result.value.payload.includeTools === false)
 }
 
 if (failures.length > 0) {

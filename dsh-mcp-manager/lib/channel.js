@@ -75,21 +75,32 @@ function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = []
     let size = 0
+    let settled = false
+    const fail = (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    }
     req.on('data', (chunk) => {
       size += chunk.length
       if (size > MAX_BODY_BYTES) {
-        reject(new Error('request body is too large'))
+        fail(new Error('request body is too large'))
         req.destroy()
         return
       }
       chunks.push(chunk)
     })
-    req.on('error', reject)
+    // A client that disconnects mid-upload emits `aborted` instead of `end` on
+    // some Node versions; without this the promise would never settle and the
+    // handler would keep its buffers alive.
+    req.on('aborted', () => fail(new Error('request aborted')))
+    req.on('error', fail)
     req.on('end', () => {
+      if (settled) return
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')))
       } catch {
-        reject(new Error('body is not JSON'))
+        fail(new Error('body is not JSON'))
       }
     })
   })
@@ -97,12 +108,37 @@ function readJsonBody(req) {
 
 /**
  * Serve one request on the manager channel.
+ *
+ * A transport-level throw (a broken socket, a `requestRejection` that itself
+ * throws) must still produce a response: an unhandled rejection here would be a
+ * process-level warning and the browser would wait for a reply that never comes.
+ *
  * @param options - `channel`, `connection` (for the trust fence), and `dispatch`.
  * @param req - node:http request.
  * @param res - node:http response.
  * @returns when the response has been written.
  */
 export async function serveChannelRequest(options, req, res) {
+  try {
+    await handleChannelRequest(options, req, res)
+  } catch (error) {
+    if (!res.headersSent) {
+      res.writeHead(500, { 'content-type': 'text/plain' })
+      res.end('internal error')
+      return
+    }
+    if (!res.writableEnded) res.end()
+  }
+}
+
+/**
+ * The actual request pipeline behind {@link serveChannelRequest}.
+ * @param options - `channel`, `connection`, and `dispatch`.
+ * @param req - node:http request.
+ * @param res - node:http response.
+ * @returns when the response has been written.
+ */
+async function handleChannelRequest(options, req, res) {
   const { channel, connection, dispatch } = options
   const rejection = connection.requestRejection(req)
   if (rejection !== undefined) {

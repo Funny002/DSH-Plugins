@@ -88,13 +88,21 @@ window.__ModuleLoader__.load({
       meta: {
         target: "目标",
         timeout: "单次调用超时",
+        connectTimeout: "连接超时",
         reconnect: "重连策略",
         connectedSince: "已连接",
         lastSync: "最近同步",
         nextRetry: "下次重试",
+        calls: "工具调用",
+        reconnects: "重连次数",
         show: "详情",
         hide: "隐藏详情",
       },
+      metrics: {
+        calls: "{calls} 次 · 平均 {avg}",
+        errors: "失败 {errors}",
+      },
+      filtered: "已过滤 {n}",
       reconnect: {
         off: "已关闭",
         policy: "最多 {attempts} 次 · {from} → {to}",
@@ -119,6 +127,10 @@ window.__ModuleLoader__.load({
         url: "服务地址（streamable-http）",
         headers: "请求头（每行 KEY: VALUE）",
         timeout: "单次调用超时（毫秒）",
+        connectTimeout: "连接超时（毫秒）",
+        filterAllow: "只暴露这些工具（每行一个，支持 * 通配）",
+        filterDeny: "隐藏这些工具（每行一个，支持 * 通配）",
+        filterHint: "匹配服务器自己的工具名；留空表示全部暴露，拒绝优先。例如 read_* 或 write_?。",
         reconnect: "断线自动重连",
         reconnectHint: "连接丢失后按指数退避重连；停机期间工具仍保持列出，只是调用会失败。",
         reconnectAttempts: "最大重连次数",
@@ -194,13 +206,21 @@ window.__ModuleLoader__.load({
       meta: {
         target: "Target",
         timeout: "Per-call timeout",
+        connectTimeout: "Connect timeout",
         reconnect: "Reconnect",
         connectedSince: "Connected",
         lastSync: "Last sync",
         nextRetry: "Next retry",
+        calls: "Tool calls",
+        reconnects: "Reconnects",
         show: "Details",
         hide: "Hide details",
       },
+      metrics: {
+        calls: "{calls} calls · {avg} avg",
+        errors: "{errors} failed",
+      },
+      filtered: "{n} filtered",
       reconnect: {
         off: "off",
         policy: "up to {attempts} · {from} → {to}",
@@ -225,6 +245,10 @@ window.__ModuleLoader__.load({
         url: "Endpoint URL (streamable-http)",
         headers: "Headers (KEY: VALUE per line)",
         timeout: "Per-call timeout (ms)",
+        connectTimeout: "Connect timeout (ms)",
+        filterAllow: "Expose only these tools (one per line, * wildcard)",
+        filterDeny: "Hide these tools (one per line, * wildcard)",
+        filterHint: "Matches the server's own tool names; empty exposes everything, deny wins. For example read_* or write_?.",
         reconnect: "Reconnect automatically",
         reconnectHint: "After a drop, retry with exponential backoff. Tools stay listed while the server is down; only calls fail.",
         reconnectAttempts: "Max reconnect attempts",
@@ -498,6 +522,9 @@ window.__ModuleLoader__.load({
         url: "",
         headersText: "",
         timeout: "60000",
+        connectTimeout: "30000",
+        filterAllowText: "",
+        filterDenyText: "",
         reconnect: true,
         reconnectAttempts: "10",
         reconnectInitialMs: "500",
@@ -519,6 +546,10 @@ window.__ModuleLoader__.load({
       draft.url = String(definition.url ?? "");
       draft.headersText = mapToLines(definition.headers);
       draft.timeout = String(definition.toolCallTimeoutMs ?? 60000);
+      draft.connectTimeout = String(definition.connectTimeoutMs ?? 30000);
+      const toolFilter = definition.toolFilter === undefined || definition.toolFilter === null ? {} : definition.toolFilter;
+      draft.filterAllowText = Array.isArray(toolFilter.allow) ? toolFilter.allow.join("\n") : "";
+      draft.filterDenyText = Array.isArray(toolFilter.deny) ? toolFilter.deny.join("\n") : "";
       const reconnect = definition.reconnect === undefined || definition.reconnect === null ? {} : definition.reconnect;
       draft.reconnect = reconnect.enabled !== false;
       draft.reconnectAttempts = String(reconnect.maxAttempts ?? 10);
@@ -536,11 +567,17 @@ window.__ModuleLoader__.load({
     /** Build the RPC definition payload from draft values. */
     function definitionFromDraft(draft) {
       const timeout = Number(draft.timeout);
+      const connectTimeout = Number(draft.connectTimeout);
       const base = {
         name: draft.name.trim(),
         enabled: draft.enabled !== false,
         transport: draft.transport,
         toolCallTimeoutMs: Number.isFinite(timeout) && timeout > 0 ? Math.trunc(timeout) : 60000,
+        connectTimeoutMs: Number.isFinite(connectTimeout) && connectTimeout > 0 ? Math.trunc(connectTimeout) : 30000,
+        toolFilter: {
+          allow: lines(draft.filterAllowText),
+          deny: lines(draft.filterDenyText),
+        },
         reconnect: {
           enabled: draft.reconnect !== false,
           initialDelayMs: positiveInteger(draft.reconnectInitialMs, 500),
@@ -598,6 +635,44 @@ window.__ModuleLoader__.load({
       if (server.state === "reconnecting") return "reconnecting";
       if (server.state === "error") return "error";
       return "idle";
+    }
+
+    /**
+     * Merge the previous tool rows into a compact status snapshot.
+     *
+     * The background poll asks the host for a snapshot without tool rows (they
+     * are the bulk of the payload) and reuses the rows it already has. A server
+     * whose `toolCount`/`lastSyncAt` moved — or that the page has never seen — is
+     * reported as stale so the caller can do one full fetch instead of showing an
+     * empty or out-of-date tool list. A host that predates `toolsIncluded` (or
+     * simply ignored the flag) already sent the rows, so nothing is merged.
+     *
+     * @param previous - the snapshot currently on screen, or null.
+     * @param next - the snapshot just received.
+     * @returns `{ snapshot, stale }`.
+     */
+    function mergeToolRows(previous, next) {
+      if (next === null || typeof next !== "object") return { snapshot: next, stale: false };
+      if (next.toolsIncluded !== false || !Array.isArray(next.servers)) return { snapshot: next, stale: false };
+      const before = new Map(
+        (previous !== null && previous !== undefined && Array.isArray(previous.servers) ? previous.servers : []).map((server) => [
+          server.name,
+          server,
+        ]),
+      );
+      let stale = false;
+      const servers = next.servers.map((server) => {
+        const prior = before.get(server.name);
+        const reusable =
+          prior !== undefined &&
+          Array.isArray(prior.tools) &&
+          prior.toolCount === server.toolCount &&
+          prior.lastSyncAt === server.lastSyncAt;
+        if (reusable) return { ...server, tools: prior.tools };
+        if ((server.toolCount ?? 0) > 0) stale = true;
+        return { ...server, tools: [] };
+      });
+      return { snapshot: { ...next, servers }, stale };
     }
     //#endregion
 
@@ -674,6 +749,9 @@ window.__ModuleLoader__.load({
                   .join(" · "),
               )
             : null,
+          (server.filteredToolCount ?? 0) > 0
+            ? h("span", { className: "dsh-mcp-chip", title: t("field.filterHint") }, fill(t("filtered"), { n: server.filteredToolCount }))
+            : null,
           h(
             "span",
             { className: "dsh-mcp-actions" },
@@ -725,7 +803,25 @@ window.__ModuleLoader__.load({
               { className: "dsh-mcp-meta" },
               metaItem("meta.target", h("code", null, server.target)),
               metaItem("meta.timeout", formatDuration(server.timeoutMs ?? 60000)),
+              metaItem("meta.connectTimeout", formatDuration(server.connectTimeoutMs ?? 30000)),
               metaItem("meta.reconnect", formatReconnectPolicy(t, reconnect)),
+              server.metrics !== undefined && (server.metrics.calls ?? 0) > 0
+                ? metaItem(
+                    "meta.calls",
+                    [
+                      fill(t("metrics.calls"), {
+                        calls: String(server.metrics.calls),
+                        avg: formatDuration(server.metrics.avgMs ?? 0),
+                      }),
+                      (server.metrics.errors ?? 0) > 0 ? fill(t("metrics.errors"), { errors: String(server.metrics.errors) }) : "",
+                    ]
+                      .filter((part) => part !== "")
+                      .join(" · "),
+                  )
+                : null,
+              server.metrics !== undefined && (server.metrics.reconnects ?? 0) > 0
+                ? metaItem("meta.reconnects", String(server.metrics.reconnects))
+                : null,
               server.state === "connected" ? metaItem("meta.connectedSince", formatAgo(t, server.startedAt, clock)) : null,
               server.state === "connected" ? metaItem("meta.lastSync", formatAgo(t, server.lastSyncAt, clock)) : null,
               server.state === "reconnecting" && reconnect.nextRetryAt
@@ -924,6 +1020,21 @@ window.__ModuleLoader__.load({
         ),
         h(
           Field,
+          { label: t("field.connectTimeout") },
+          h("input", { ...input("connectTimeout"), type: "number", min: "1", step: "1000" }),
+        ),
+        h(
+          Field,
+          { label: t("field.filterAllow"), hint: t("field.filterHint") },
+          h("textarea", { value: draft.filterAllowText, onChange: (event) => update({ filterAllowText: event.target.value }) }),
+        ),
+        h(
+          Field,
+          { label: t("field.filterDeny") },
+          h("textarea", { value: draft.filterDenyText, onChange: (event) => update({ filterDenyText: event.target.value }) }),
+        ),
+        h(
+          Field,
           { label: t("field.reconnect"), hint: t("field.reconnectHint") },
           h("input", {
             type: "checkbox",
@@ -975,8 +1086,18 @@ window.__ModuleLoader__.load({
       const reloadTimer = useRef(null);
       const generationRef = useRef(0);
       const noticeTimer = useRef(null);
+      /** The snapshot on screen, so a compact poll can reuse its tool rows. */
+      const snapshotRef = useRef(null);
       /** Page clock for relative times; advances with each poll and each retry countdown tick. */
       const [clock, setClock] = useState(() => Date.now());
+
+      /** Install one snapshot: state, clock, and the generation the page is on. */
+      const storeSnapshot = useCallback((next) => {
+        snapshotRef.current = next;
+        setSnapshot(next);
+        setClock(Date.now());
+        if (next !== null && typeof next.generation === "number") generationRef.current = next.generation;
+      }, []);
 
       /** Clear the status notice and cancel its pending dismissal. */
       const dismissNotice = useCallback(() => {
@@ -1013,17 +1134,22 @@ window.__ModuleLoader__.load({
 
       const load = useCallback(async () => {
         try {
-          const next = await call("state", {});
-          setSnapshot(next);
-          setClock(Date.now());
-          generationRef.current = next.generation;
+          // Poll for the cheap shape: the tool rows (one description per tool) are
+          // the bulk of the snapshot, and only an expanded card needs them.
+          const compact = await call("state", { includeTools: false });
+          const merged = mergeToolRows(snapshotRef.current, compact);
+          let next = merged.snapshot;
+          // A server whose tool list actually changed needs one full fetch. This
+          // is rare, and it keeps the expanded card truthful.
+          if (merged.stale) next = await call("state", {});
+          storeSnapshot(next);
           setError("");
           return next;
         } catch (failure) {
           setError(String((failure && failure.message) || failure));
           return null;
         }
-      }, [call]);
+      }, [call, storeSnapshot]);
 
       useEffect(() => {
         void load();
@@ -1052,12 +1178,10 @@ window.__ModuleLoader__.load({
           void call("state", {})
             .then((next) => {
               reloadTimer.current = null;
-              setSnapshot(next);
+              const changed = next.generation !== generationRef.current;
+              storeSnapshot(next);
               setError("");
-              if (next.generation !== generationRef.current) {
-                generationRef.current = next.generation;
-                showNotice(t("notice.reloaded"));
-              }
+              if (changed) showNotice(t("notice.reloaded"));
             })
             .catch(() => {
               if (tries < RELOAD_POLL_TRIES) reloadTimer.current = setTimeout(tick, RELOAD_POLL_MS);
@@ -1065,7 +1189,7 @@ window.__ModuleLoader__.load({
             });
         };
         reloadTimer.current = setTimeout(tick, RELOAD_POLL_MS);
-      }, [call, showNotice, t]);
+      }, [call, showNotice, storeSnapshot, t]);
 
       const mutate = useCallback(
         (endpoint, payload, message) => {
@@ -1075,7 +1199,7 @@ window.__ModuleLoader__.load({
           return Promise.resolve()
             .then(() => call(endpoint, payload))
             .then((value) => {
-              if (value && value.snapshot) setSnapshot(value.snapshot);
+              if (value && value.snapshot) storeSnapshot(value.snapshot);
               if (value && typeof value.generation === "number") generationRef.current = value.generation;
               showNotice(message);
               settleAfterSave();
@@ -1086,7 +1210,7 @@ window.__ModuleLoader__.load({
             })
             .finally(() => setBusy(""));
         },
-        [call, dismissNotice, settleAfterSave, showNotice],
+        [call, dismissNotice, settleAfterSave, showNotice, storeSnapshot],
       );
 
       const onToggle = useCallback(
@@ -1117,13 +1241,13 @@ window.__ModuleLoader__.load({
           void Promise.resolve()
             .then(() => call("refresh", server === undefined ? {} : { name: server.name }))
             .then((next) => {
-              if (next && Array.isArray(next.servers)) setSnapshot(next);
+              if (next && Array.isArray(next.servers)) storeSnapshot(next);
               showNotice(t("notice.refreshed"));
             })
             .catch((failure) => setError(String((failure && failure.message) || failure)))
             .finally(() => setBusy(""));
         },
-        [call, dismissNotice, showNotice, t],
+        [call, dismissNotice, showNotice, storeSnapshot, t],
       );
 
       const onSubmitDraft = useCallback(
@@ -1333,6 +1457,7 @@ window.__ModuleLoader__.load({
       formatDuration,
       formatReconnectPolicy,
       formatRetryIn,
+      mergeToolRows,
       positiveInteger,
     };
     exports.__dictionaries = { zh, en };

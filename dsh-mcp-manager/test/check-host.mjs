@@ -5,7 +5,7 @@
  *
  *   node test/check-host.mjs
  */
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -44,13 +44,26 @@ check(
     resolved.servers[0].reconnect.maxAttempts === 10 &&
     resolved.servers[0].reconnect.initialDelayMs === 500,
 )
+check('connect timeout default is resolved by the schema', resolved.servers[0].connectTimeoutMs === 30000)
+check(
+  'tool filter default is resolved by the schema',
+  JSON.stringify(resolved.servers[0].toolFilter) === JSON.stringify({ allow: [], deny: [] }),
+)
 
 // ── definition normalization ─────────────────────────────────────────────────
+const { normalizeToolFilter } = await import(lib('index.js'))
 const stdio = normalizeServer({ name: 'echo', transport: 'stdio', command: ' node ', args: 'a\nb\n', env: { A: 'env.HOME' }, extra: 'dropped' })
 check('normalizes command', stdio.command === 'node')
 check('args from text', JSON.stringify(stdio.args) === '["a","b"]')
 check('drops unknown fields', !('extra' in stdio))
 check('reconnect is normalized into the definition', stdio.reconnect.enabled === true && stdio.reconnect.maxAttempts === 10)
+check('connect timeout is normalized into the definition', stdio.connectTimeoutMs === 30000)
+check('a blank tool filter is normalized', JSON.stringify(stdio.toolFilter) === JSON.stringify({ allow: [], deny: [] }))
+check(
+  'tool filter entries are trimmed and blanks dropped',
+  JSON.stringify(normalizeToolFilter({ allow: [' echo ', ''], deny: ['write_*'] })) ===
+    JSON.stringify({ allow: ['echo'], deny: ['write_*'] }),
+)
 check(
   'unknown reconnect keys are dropped on write',
   JSON.stringify(Object.keys(normalizeReconnect({ enabled: false, bogus: 1 })).sort()) ===
@@ -61,6 +74,7 @@ for (const [label, input] of [
   ['missing command', { name: 'x', transport: 'stdio' }],
   ['missing url', { name: 'x', transport: 'streamable-http' }],
   ['bad url', { name: 'x', transport: 'streamable-http', url: 'not a url' }],
+  ['non-http url scheme', { name: 'x', transport: 'streamable-http', url: 'file:///tmp/mcp' }],
   ['bad transport', { name: 'x', transport: 'sse', command: 'node' }],
 ]) {
   let threw = false
@@ -171,7 +185,60 @@ check('env.NAME indirection', supervisor.resolveEnvValue('env.PATH') === process
 check('${NAME} indirection', supervisor.resolveEnvValue('${PATH}') === process.env.PATH)
 check('an unset name resolves empty', supervisor.resolveEnvValue('env.DSH_MCP_MANAGER_NOT_SET') === '')
 
+// ── connect timeout and tool filter ─────────────────────────────────────────
+check('connect timeout defaults to 30s', supervisor.resolveConnectTimeout(undefined) === 30000)
+check('an explicit connect timeout is kept', supervisor.resolveConnectTimeout(1500) === 1500)
+for (const [label, value] of [
+  ['zero connect timeout', 0],
+  ['negative connect timeout', -5],
+  ['non-numeric connect timeout', Number.NaN],
+]) {
+  let threw = false
+  try {
+    supervisor.resolveConnectTimeout(value)
+  } catch {
+    threw = true
+  }
+  check(`refuses ${label}`, threw)
+}
+
+const filter = supervisor.resolveToolFilter({ allow: ['read_*', 'list_?'], deny: ['read_secret*'] })
+check('a resolved filter is frozen', Object.isFrozen(filter) && Object.isFrozen(filter.allow))
+check('an empty filter admits everything', supervisor.matchesToolFilter(undefined, 'anything'))
+check('allow patterns are anchored and wildcarded', supervisor.matchesToolFilter(filter, 'read_file'))
+check('single-character wildcards work', supervisor.matchesToolFilter(filter, 'list_a') && !supervisor.matchesToolFilter(filter, 'list_ab'))
+check('an unlisted tool is hidden by an allow list', !supervisor.matchesToolFilter(filter, 'write_file'))
+check('deny wins over allow', !supervisor.matchesToolFilter(filter, 'read_secret_key'))
+check('a filter pattern is literal except for its wildcards', !supervisor.matchesToolFilter({ allow: ['a.b'], deny: [] }, 'axb'))
+for (const [label, input] of [
+  ['a non-array allow list', { allow: 'echo' }],
+  ['an empty pattern', { allow: [''] }],
+  ['a non-string pattern', { deny: [1] }],
+  ['an unknown filter key', { allow: [], include: ['x'] }],
+]) {
+  let threw = false
+  try {
+    supervisor.resolveToolFilter(input)
+  } catch {
+    threw = true
+  }
+  check(`refuses ${label}`, threw)
+}
+
+// ── diagnostics keep their cause ────────────────────────────────────────────
+{
+  const wrapped = new TypeError('fetch failed', { cause: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) })
+  check('an error message keeps its cause', naming.errorMessage(wrapped) === 'fetch failed: connect ECONNREFUSED', naming.errorMessage(wrapped))
+  check('a cause already in the message is not repeated', naming.errorMessage(new Error('boom: boom')) === 'boom: boom')
+  check('a self-referential cause is ignored', (() => {
+    const loop = new Error('loop')
+    loop.cause = loop
+    return naming.errorMessage(loop) === 'loop'
+  })())
+}
+
 // ── managed patch block: insert mode (loose copy) ───────────────────────────
+
 const template = '# Your patch layer\n# a top-level YAML array of loader patch entries\n[]\n'
 const servers = [
   {
@@ -244,6 +311,25 @@ patchFile.writeManagedServers(target, servers, { mode: 'override' })
 const persisted = patchFile.readManagedBlock(readFileSync(target, 'utf8'))
 check('the write path can switch modes in place', persisted.mode === 'override' && persisted.servers.length === 2)
 check('a switched block drops the stale row name', readFileSync(target, 'utf8').includes('name:') === false)
+
+// ── atomic write: line endings, temp files, fresh files ─────────────────────
+const crlfFile = join(dir, 'crlf.yml')
+writeFileSync(crlfFile, '# a comment\r\n[]\r\n', 'utf8')
+patchFile.writeManagedServers(crlfFile, servers, { mode: 'insert' })
+const crlfText = readFileSync(crlfFile, 'utf8')
+check('a CRLF patch file keeps its line endings', crlfText.includes('\r\n') && !/[^\r]\n/.test(crlfText), JSON.stringify(crlfText.slice(0, 80)))
+check(
+  'a CRLF write still round-trips',
+  JSON.stringify(patchFile.readManagedBlock(crlfText).servers) === JSON.stringify(servers),
+)
+const leftovers = readdirSync(dir).filter((name) => name.includes('.dsh-mcp-manager.tmp'))
+check('the atomic write leaves no temp file behind', leftovers.length === 0, leftovers.join(','))
+
+const freshFile = join(dir, 'fresh.yml')
+patchFile.writeManagedServers(freshFile, [], { mode: 'override' })
+const freshText = readFileSync(freshFile, 'utf8')
+check('a missing patch file is created with the stock header', freshText.includes('# Your patch layer'))
+check('a fresh file gets an empty servers list', freshText.includes('servers: []'))
 
 if (failures.length > 0) {
   console.error(`host check FAILED (${failures.length})`)

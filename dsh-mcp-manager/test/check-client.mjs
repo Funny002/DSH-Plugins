@@ -142,11 +142,12 @@ const strictT = (key) => {
 
 const snapshot = {
   generation: 1,
-  version: '0.2.0',
+  version: '0.3.0',
   rowId: 'mcp-manager',
   channel: { path: '/mcp-manager', state: 'registered', error: '' },
   patchFile: 'C:/Users/x/.dsh/profiles/web/cordis.patch.yml',
   persistence: { writable: true, patchFile: 'C:/Users/x/.dsh/profiles/web/cordis.patch.yml' },
+  toolsIncluded: true,
   servers: [
     {
       name: 'echo',
@@ -162,6 +163,8 @@ const snapshot = {
         env: { A: 'b' },
         cwd: '',
         toolCallTimeoutMs: 60000,
+        connectTimeoutMs: 30000,
+        toolFilter: { allow: [], deny: [] },
         reconnect: { enabled: true, initialDelayMs: 500, maxDelayMs: 30000, maxAttempts: 10 },
       },
       state: 'connected',
@@ -174,6 +177,10 @@ const snapshot = {
       startedAt: 1,
       lastSyncAt: 2,
       timeoutMs: 60000,
+      connectTimeoutMs: 30000,
+      toolFilter: { allow: [], deny: [] },
+      filteredToolCount: 0,
+      metrics: { calls: 4, errors: 1, avgMs: 12, lastCallMs: 8, lastCallAt: 3, reconnects: 2 },
       reconnect: { enabled: true, initialDelayMs: 500, maxDelayMs: 30000, maxAttempts: 10, attempts: 0, nextRetryAt: 0 },
     },
     {
@@ -188,6 +195,8 @@ const snapshot = {
         url: 'http://127.0.0.1:1/mcp',
         headers: {},
         toolCallTimeoutMs: 60000,
+        connectTimeoutMs: 30000,
+        toolFilter: { allow: [], deny: [] },
         reconnect: { enabled: true, initialDelayMs: 500, maxDelayMs: 30000, maxAttempts: 10 },
       },
       state: 'error',
@@ -197,6 +206,10 @@ const snapshot = {
       startedAt: 0,
       lastSyncAt: 0,
       timeoutMs: 60000,
+      connectTimeoutMs: 30000,
+      toolFilter: { allow: [], deny: [] },
+      filteredToolCount: 3,
+      metrics: { calls: 0, errors: 0, avgMs: 0, lastCallMs: 0, lastCallAt: 0, reconnects: 0 },
       reconnect: { enabled: true, initialDelayMs: 500, maxDelayMs: 30000, maxAttempts: 10, attempts: 11, nextRetryAt: 0 },
     },
     {
@@ -213,6 +226,8 @@ const snapshot = {
         env: {},
         cwd: '',
         toolCallTimeoutMs: 60000,
+        connectTimeoutMs: 30000,
+        toolFilter: { allow: [], deny: [] },
         reconnect: { enabled: true, initialDelayMs: 500, maxDelayMs: 30000, maxAttempts: 3 },
       },
       state: 'reconnecting',
@@ -222,6 +237,10 @@ const snapshot = {
       startedAt: 0,
       lastSyncAt: 0,
       timeoutMs: 60000,
+      connectTimeoutMs: 30000,
+      toolFilter: { allow: [], deny: [] },
+      filteredToolCount: 0,
+      metrics: { calls: 0, errors: 0, avgMs: 0, lastCallMs: 0, lastCallAt: 0, reconnects: 0 },
       reconnect: { enabled: true, initialDelayMs: 500, maxDelayMs: 30000, maxAttempts: 3, attempts: 2, nextRetryAt: 1700000000000 },
     },
     {
@@ -238,6 +257,8 @@ const snapshot = {
         env: {},
         cwd: '',
         toolCallTimeoutMs: 60000,
+        connectTimeoutMs: 30000,
+        toolFilter: { allow: [], deny: [] },
         reconnect: { enabled: true, initialDelayMs: 500, maxDelayMs: 30000, maxAttempts: 10 },
       },
       state: 'disabled',
@@ -247,6 +268,10 @@ const snapshot = {
       startedAt: 0,
       lastSyncAt: 0,
       timeoutMs: 60000,
+      connectTimeoutMs: 30000,
+      toolFilter: { allow: [], deny: [] },
+      filteredToolCount: 0,
+      metrics: { calls: 0, errors: 0, avgMs: 0, lastCallMs: 0, lastCallAt: 0, reconnects: 0 },
       reconnect: { enabled: true, initialDelayMs: 500, maxDelayMs: 30000, maxAttempts: 10, attempts: 0, nextRetryAt: 0 },
     },
   ],
@@ -368,6 +393,17 @@ function collectText(node, out = []) {
   check('a connected card shows the connection age', healthy.includes('已连接'), healthy)
   check('a connected card keeps the renamed tool readable', healthy.includes('mcp__echo__add') && healthy.includes('mcp__echo__echo'), healthy)
 
+  // Round 3: per-server health metrics and the filter indicator.
+  check('the meta grid shows the connect timeout', healthy.includes('连接超时') && healthy.includes('30s'), healthy)
+  check('the card shows call metrics', healthy.includes('工具调用') && healthy.includes('4 次 · 平均 12ms'), healthy)
+  check('the card shows failed calls', healthy.includes('失败 1'), healthy)
+  check('the card shows the reconnect count', healthy.includes('重连次数') && healthy.includes('2'), healthy)
+  const filteredCard = card(snapshot.servers.find((server) => server.name === 'broken'), 1_700_000_000_000, {
+    meta: false,
+    tools: false,
+  })
+  check('a filtered-tool chip is visible while folded', filteredCard.includes('已过滤 3'), filteredCard)
+
   // Progressive disclosure: the default card is the identity line, one target
   // line, the error, and two disclosures — the policy grid stays folded.
   const folded = card(snapshot.servers.find((server) => server.name === 'echo'), 1_700_000_000_000, { meta: false, tools: false })
@@ -382,6 +418,37 @@ function collectText(node, out = []) {
     tools: false,
   })
   check('an error stays visible while folded', errorFolded.includes('spawn ENOENT'), errorFolded)
+}
+
+// ── compact status polling (round 2) ───────────────────────────────────────
+{
+  const { mergeToolRows } = plugin.__helpers
+  const compact = {
+    ...snapshot,
+    toolsIncluded: false,
+    servers: snapshot.servers.map((server) => {
+      const { tools, ...rest } = server
+      void tools
+      return rest
+    }),
+  }
+  const first = mergeToolRows(null, compact)
+  check('a first compact snapshot is stale', first.stale === true)
+  check('a stale compact snapshot keeps the tool count', first.snapshot.servers[0].toolCount === 2)
+
+  const merged = mergeToolRows(snapshot, compact)
+  check('unchanged tool rows are reused', merged.stale === false && merged.snapshot.servers[0].tools.length === 2, JSON.stringify(merged.stale))
+  check(
+    'a compact poll keeps the other server fields',
+    merged.snapshot.servers[0].state === 'connected' && merged.snapshot.generation === snapshot.generation,
+  )
+  const moved = mergeToolRows(snapshot, {
+    ...compact,
+    servers: compact.servers.map((server) => (server.name === 'echo' ? { ...server, lastSyncAt: 99 } : server)),
+  })
+  check('a moved lastSyncAt invalidates the reused rows', moved.stale === true && moved.snapshot.servers[0].tools.length === 0)
+  const legacyHost = mergeToolRows(snapshot, { ...snapshot, toolsIncluded: undefined })
+  check('an older full payload passes through', legacyHost.stale === false && legacyHost.snapshot.servers[0].tools.length === 2)
 }
 
 // ── the loaded page: title, description, summary, and the one-line footer ───
@@ -472,7 +539,7 @@ function findElement(node, predicate) {
     text,
   )
   check('the loaded page summarises the live state', text.includes('重连'), text)
-  check('the page identifies its version', text.includes('v0.2.0'), text)
+  check('the page identifies its version', text.includes('v0.3.0'), text)
 }
 
 {
@@ -484,7 +551,7 @@ function findElement(node, predicate) {
     close: () => {},
   })
   const text = collectText(await legacy.settle()).join(' | ')
-  check('an unversioned host renders no badge', !text.includes('v0.2.0') && !/ \| v \| /.test(text), text)
+  check('an unversioned host renders no badge', !text.includes('v0.3.0') && !/ \| v \| /.test(text), text)
   check('the page still renders without a version', text.includes('MCP 服务器'), text)
 }
 

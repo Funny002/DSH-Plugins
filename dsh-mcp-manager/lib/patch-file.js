@@ -42,7 +42,7 @@
  *
  * @module dsh-mcp-manager/patch-file
  */
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -101,6 +101,20 @@ export function discoverPatchFile(ctx) {
  */
 function toLines(text) {
   return text.split(/\r?\n/)
+}
+
+/**
+ * Detect the line terminator a file already uses.
+ *
+ * The managed block is only a few lines of a user-owned file full of prose and
+ * other patches; rewriting the whole file with LF would turn one settings-page
+ * save into a whole-file diff on a CRLF checkout (and on Windows editors that
+ * normalize to CRLF). The existing convention wins.
+ * @param text - current file content.
+ * @returns the terminator to join with.
+ */
+function detectEol(text) {
+  return typeof text === 'string' && text.includes('\r\n') ? '\r\n' : '\n'
 }
 
 /**
@@ -180,14 +194,15 @@ export function renderManagedBlock(servers, options = {}) {
  */
 export function upsertManagedBlock(text, block) {
   const source = typeof text === 'string' ? text : ''
+  const eol = detectEol(source)
   const lines = toLines(source)
   const start = lines.findIndex((line) => line.includes(BLOCK_START))
-  if (start === -1) return appendManagedBlock(source, lines, block)
+  if (start === -1) return appendManagedBlock(source, lines, block, eol)
   const end = lines.findIndex((line, index) => index > start && line.includes(BLOCK_END))
   const tail = lines.slice(end === -1 ? lines.length : end + 1)
   const head = lines.slice(0, start)
   const next = [...head, ...toLines(block), ...tail]
-  return next.join('\n')
+  return next.join(eol)
 }
 
 /** Content lines only: blanks and comments are not entries. */
@@ -206,9 +221,10 @@ function meaningfulLines(lines) {
  * @param source - current file content.
  * @param lines - source split into lines.
  * @param block - rendered block text.
+ * @param eol - the file's line terminator.
  * @returns the next file content.
  */
-function appendManagedBlock(source, lines, block) {
+function appendManagedBlock(source, lines, block, eol) {
   const meaningful = meaningfulLines(lines)
   if (meaningful.length === 1 && meaningful[0].trim().startsWith('[')) {
     const inline = meaningful[0].trim()
@@ -218,13 +234,13 @@ function appendManagedBlock(source, lines, block) {
       )
     }
     const index = lines.findIndex((line) => line.trim() === '[]')
-    return [...lines.slice(0, index), ...toLines(block), ...lines.slice(index + 1)].join('\n')
+    return [...lines.slice(0, index), ...toLines(block), ...lines.slice(index + 1)].join(eol)
   }
   if (meaningful.length > 0 && !/^\s*-\s/.test(meaningful[0])) {
     throw new Error('拒绝写入：patch 层不是顶层 patch 条目列表')
   }
   const head = source.trimEnd()
-  return `${head === '' ? '' : `${head}\n\n`}${block}\n`
+  return `${head === '' ? '' : `${head}${eol}${eol}`}${block}${eol}`
 }
 
 /**
@@ -282,8 +298,38 @@ export function writeManagedServers(file, servers, options = {}) {
   if (verified.mode !== (options.mode === MANAGED_MODES.override ? MANAGED_MODES.override : MANAGED_MODES.insert)) {
     throw new Error('dsh-mcp-manager：受管区块的模式无法往返解析，拒绝写入（以免重复挂载该行）')
   }
-  const temporary = `${file}.dsh-mcp-manager.tmp`
-  writeFileSync(temporary, next, 'utf8')
-  renameSync(temporary, file)
-  return file
+  // A pid- and time-suffixed temp name keeps two writers (a second dsh process on
+  // the same profile, or a retry racing a slow rename) from sharing one scratch
+  // file and renaming each other's half-written content into place.
+  const temporary = `${file}.${String(process.pid)}.${Date.now().toString(36)}.dsh-mcp-manager.tmp`
+  let temporaryExists = false
+  try {
+    const fd = openSync(temporary, 'w')
+    temporaryExists = true
+    try {
+      writeFileSync(fd, next, 'utf8')
+      // The rename alone only guarantees a complete *name*; without fsync a crash
+      // can leave the profile with an empty patch layer.
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    // Keep the user's file mode (a patch file can carry credentials).
+    try {
+      chmodSync(temporary, statSync(file).mode)
+    } catch {
+      /* a new file keeps the platform default */
+    }
+    renameSync(temporary, file)
+    temporaryExists = false
+    return file
+  } finally {
+    if (temporaryExists) {
+      try {
+        unlinkSync(temporary)
+      } catch {
+        /* the rename already consumed it, or the directory is gone */
+      }
+    }
+  }
 }

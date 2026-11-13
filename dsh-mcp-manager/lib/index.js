@@ -30,7 +30,6 @@
  */
 import { Service } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { serveChannelRequest } from './channel.js'
 import { errorMessage, isRecord } from './naming.js'
@@ -42,12 +41,16 @@ import {
   writeManagedServers,
 } from './patch-file.js'
 import {
+  DEFAULT_CONNECT_TIMEOUT_MS,
   DEFAULT_TOOL_CALL_TIMEOUT_MS,
   McpServerSupervisor,
   RECONNECT_DEFAULTS,
   probeServer,
+  resolveConnectTimeout,
   resolveReconnectPolicy,
+  resolveToolFilter,
 } from './supervisor.js'
+import { VERSION } from './version.js'
 
 /** Cordis plugin name used by loader diagnostics. */
 export const name = 'mcp-manager'
@@ -60,28 +63,13 @@ export const CHANNEL = '/mcp-manager'
  * the settings page can show a single version identity. A missing or unreadable
  * manifest must not fail the row: the badge is diagnostic, not functional.
  */
-export const VERSION = readPackageVersion()
+export { VERSION }
 /** Valid server namespace, kept inside the public tool-name budget. */
 const SERVER_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/
 /** Shortest usable numeric config value. */
 const MIN_TIMEOUT_MS = 1
 /** This module's own path, used to tell "our block inserted the row" from "a bundle did". */
 const SELF_MODULE_PATH = fileURLToPath(import.meta.url)
-/** Shown when the manifest cannot be read; never a valid published version. */
-const UNKNOWN_VERSION = '0.0.0'
-
-/**
- * Read `version` from the package manifest beside this module.
- * @returns the declared version, or `0.0.0` when it cannot be read.
- */
-function readPackageVersion() {
-  try {
-    const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
-    return typeof manifest.version === 'string' && manifest.version !== '' ? manifest.version : UNKNOWN_VERSION
-  } catch {
-    return UNKNOWN_VERSION
-  }
-}
 
 /**
  * Reconnect policy for one server. Every bound is re-validated by
@@ -95,6 +83,12 @@ const ReconnectSchema = z.object({
   maxAttempts: z.number().default(RECONNECT_DEFAULTS.maxAttempts),
 })
 
+/** Optional per-server exposure filter for the server's own tool names. */
+const ToolFilterSchema = z.object({
+  allow: z.array(String).default([]),
+  deny: z.array(String).default([]),
+})
+
 const StdioServerSchema = z.object({
   name: z.string().required().pattern(SERVER_NAME_PATTERN),
   enabled: z.boolean().default(true),
@@ -104,6 +98,8 @@ const StdioServerSchema = z.object({
   env: z.dict(String).default({}),
   cwd: z.string().default(''),
   toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
+  connectTimeoutMs: z.number().default(DEFAULT_CONNECT_TIMEOUT_MS),
+  toolFilter: ToolFilterSchema,
   reconnect: ReconnectSchema,
 })
 
@@ -114,6 +110,8 @@ const StreamableHttpServerSchema = z.object({
   url: z.string().required(),
   headers: z.dict(String).default({}),
   toolCallTimeoutMs: z.number().default(DEFAULT_TOOL_CALL_TIMEOUT_MS),
+  connectTimeoutMs: z.number().default(DEFAULT_CONNECT_TIMEOUT_MS),
+  toolFilter: ToolFilterSchema,
   reconnect: ReconnectSchema,
 })
 
@@ -183,6 +181,24 @@ export function normalizeReconnect(input) {
 }
 
 /**
+ * Coerce one untrusted value into a tool filter.
+ *
+ * Entries are trimmed and emptied dropped here; bounds and pattern shape are
+ * judged by `resolveToolFilter` when the supervisor is built, so a hand-written
+ * patch entry with an oversized list still fails loudly.
+ * @param input - untrusted `toolFilter` value.
+ * @returns a fresh `{ allow, deny }` filter.
+ */
+export function normalizeToolFilter(input) {
+  const list = (key) => {
+    const value = isRecord(input) ? input[key] : undefined
+    if (!Array.isArray(value)) return []
+    return value.map((entry) => String(entry).trim()).filter((entry) => entry !== '')
+  }
+  return { allow: list('allow'), deny: list('deny') }
+}
+
+/**
  * Validate and normalize one server definition.
  *
  * Unknown fields are dropped, so what the settings page writes back is exactly
@@ -200,18 +216,28 @@ export function normalizeServer(input) {
   const timeout = Number.isFinite(Number(input.toolCallTimeoutMs))
     ? Math.max(MIN_TIMEOUT_MS, Math.trunc(Number(input.toolCallTimeoutMs)))
     : DEFAULT_TOOL_CALL_TIMEOUT_MS
+  const connectTimeout = Number.isFinite(Number(input.connectTimeoutMs))
+    ? Math.max(MIN_TIMEOUT_MS, Math.trunc(Number(input.connectTimeoutMs)))
+    : DEFAULT_CONNECT_TIMEOUT_MS
   const enabled = input.enabled !== false
   const reconnect = normalizeReconnect(input.reconnect)
+  const toolFilter = normalizeToolFilter(input.toolFilter)
   if (input.transport === 'streamable-http') {
     let url = String(input.url ?? '').trim()
     if (url === '') throw new Error(`服务器 "${serverName}"：streamable-http 必须填写地址（url）`)
     // `localhost:3000/mcp` and `127.0.0.1:8931/mcp` are what people type; only a
     // missing scheme is filled in, and the normalized value is what gets stored.
     if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(url)) url = `http://${url}`
+    let parsed
     try {
-      void new URL(url)
+      parsed = new URL(url)
     } catch {
       throw new Error(`服务器 "${serverName}"：${JSON.stringify(url)} 不是合法的 URL`)
+    }
+    // The transport only speaks HTTP(S); a `file:`/`ws:` value would otherwise
+    // fail later as a bare "fetch failed" with the real cause buried in `cause`.
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      throw new Error(`服务器 "${serverName}"：${JSON.stringify(url)} 的协议必须是 http 或 https`)
     }
     return {
       name: serverName,
@@ -220,6 +246,8 @@ export function normalizeServer(input) {
       url,
       headers: toStringMap(input.headers),
       toolCallTimeoutMs: timeout,
+      connectTimeoutMs: connectTimeout,
+      toolFilter,
       reconnect,
     }
   }
@@ -237,6 +265,8 @@ export function normalizeServer(input) {
     env: toStringMap(input.env),
     cwd: String(input.cwd ?? ''),
     toolCallTimeoutMs: timeout,
+    connectTimeoutMs: connectTimeout,
+    toolFilter,
     reconnect,
   }
 }
@@ -305,6 +335,11 @@ export class McpManager extends Service {
   supervisors = new Map()
   /** @type {number} changes on every persisted mutation; the settings page polls it across a hot swap. */
   generation
+  /**
+   * Serializes persisted mutations (plan → file write → runtime swap).
+   * @type {Promise<void>}
+   */
+  mutationChain = Promise.resolve()
   /** @type {string} absolute path of the profile patch file, or `''` when it could not be resolved. */
   patchFile
   /** @type {string} explicit `patchFile` from the row config, kept when writing the block back. */
@@ -331,6 +366,8 @@ export class McpManager extends Service {
     // Fail the row here rather than starting a server with a broken policy.
     for (const definition of this.definitions) {
       resolveReconnectPolicy(definition.reconnect, `mcp-manager(${definition.name}): reconnect`)
+      resolveConnectTimeout(definition.connectTimeoutMs, `mcp-manager(${definition.name}): connectTimeoutMs`)
+      resolveToolFilter(definition.toolFilter, `mcp-manager(${definition.name}): toolFilter`)
     }
     this.patchFilePinned = config.patchFile === undefined ? '' : String(config.patchFile)
     this.patchFile = this.patchFilePinned === '' ? discoverPatchFile(ctx) : this.patchFilePinned
@@ -356,18 +393,26 @@ export class McpManager extends Service {
 
   /**
    * Live runtime state for every configured server.
+   *
+   * `includeTools: false` keeps the payload small enough to poll (tool
+   * descriptions dominate it) while still reporting counts and timing; the
+   * settings page keeps its expanded tool rows locally and refetches when a
+   * server's list actually changes.
+   *
+   * @param options - `includeTools: false` omits per-server tool rows.
    * @returns a plain JSON-safe snapshot (the RPC `state` payload).
    */
-  list() {
+  list(options = {}) {
+    const includeTools = options.includeTools !== false
     const servers = [...this.supervisors.values()].map((supervisor) => {
-      const status = supervisor.status()
+      const status = supervisor.status({ includeTools })
       if (status.enabled) return status
       return {
         ...status,
         state: 'disabled',
         error: '',
         toolCount: 0,
-        tools: [],
+        ...(includeTools ? { tools: [] } : {}),
         startedAt: 0,
         lastSyncAt: 0,
         reconnect: { ...status.reconnect, attempts: 0, nextRetryAt: 0 },
@@ -382,6 +427,7 @@ export class McpManager extends Service {
       channel: { ...this.channel },
       patchFile: this.patchFile,
       persistence: { writable: this.patchFile !== '', patchFile: this.patchFile, mode: this.managedMode },
+      toolsIncluded: includeTools,
       servers,
       totals: {
         servers: servers.length,
@@ -418,32 +464,64 @@ export class McpManager extends Service {
    * @returns the write receipt plus the refreshed snapshot.
    */
   async commit(next) {
-    assertUniqueNames(next)
-    if (this.patchFile === '') {
-      throw new Error(
-        '无法持久化：没有找到 profile 的 patch 文件。请在 mcp-manager 行的 config 里显式设置 patchFile，或在 profile 目录中运行本插件。',
-      )
-    }
-    // Re-read how the row is mounted rather than trusting the value cached at
-    // activation: writing `insert` for a row a bundle already provides would
-    // mount it twice on the next launch.
-    this.managedMode = resolveManagedMode(this.ctx)
-    writeManagedServers(this.patchFile, next, {
-      mode: this.managedMode,
-      rowName: this.managedMode === 'insert' ? readManagedRowName(this.patchFile) : DEFAULT_ROW_NAME,
-      patchFile: this.patchFilePinned,
+    return this.queueMutation(() => next)
+  }
+
+  /**
+   * Queue one persisted mutation and return its write receipt.
+   *
+   * Two settings-page actions can overlap (a second click, a second tab): the
+   * patch-file write, the in-memory definition swap, and the supervisor swap must
+   * not interleave, or the later action would be planned from a stale definition
+   * list and the earlier one's runtime change could be disposed twice. The plan
+   * callback therefore runs *inside* the chain, against the list in effect at that
+   * moment, and the chain itself never rejects (a failed mutation must not poison
+   * the next one).
+   *
+   * @param plan - receives the current definition list and returns the next one.
+   * @returns the write receipt plus the refreshed snapshot.
+   */
+  async queueMutation(plan) {
+    const run = this.mutationChain.then(async () => {
+      const next = plan(this.definitions)
+      assertUniqueNames(next)
+      if (this.patchFile === '') {
+        throw new Error(
+          '无法持久化：没有找到 profile 的 patch 文件。请在 mcp-manager 行的 config 里显式设置 patchFile，或在 profile 目录中运行本插件。',
+        )
+      }
+      // Re-read how the row is mounted rather than trusting the value cached at
+      // activation: writing `insert` for a row a bundle already provides would
+      // mount it twice on the next launch.
+      this.managedMode = resolveManagedMode(this.ctx)
+      writeManagedServers(this.patchFile, next, {
+        mode: this.managedMode,
+        rowName: this.managedMode === 'insert' ? readManagedRowName(this.patchFile) : DEFAULT_ROW_NAME,
+        patchFile: this.patchFilePinned,
+      })
+      this.definitions = next
+      this.generation = Date.now()
+      try {
+        await this.applyRuntime(next)
+      } catch (error) {
+        // The file is already durable and the live patch reload will re-mount the
+        // row from it, so a failed in-process swap is reported, not fatal.
+        this.ctx.logger.error('mcp-manager: 已写入配置，但应用到运行中的服务器时失败: %s', errorMessage(error))
+      }
+      return {
+        persisted: true,
+        patchFile: this.patchFile,
+        mode: this.managedMode,
+        generation: this.generation,
+        reloading: true,
+        snapshot: this.list(),
+      }
     })
-    this.definitions = next
-    this.generation = Date.now()
-    await this.applyRuntime(next)
-    return {
-      persisted: true,
-      patchFile: this.patchFile,
-      mode: this.managedMode,
-      generation: this.generation,
-      reloading: true,
-      snapshot: this.list(),
-    }
+    this.mutationChain = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    return run
   }
 
   /**
@@ -475,10 +553,12 @@ export class McpManager extends Service {
    */
   async add(input) {
     const definition = normalizeServer(input)
-    if (this.definitions.some((server) => server.name === definition.name)) {
-      throw new Error(`服务器 "${definition.name}" 已存在：请换一个名称，或直接编辑该服务器`)
-    }
-    return this.commit([...this.definitions, definition])
+    return this.queueMutation((current) => {
+      if (current.some((server) => server.name === definition.name)) {
+        throw new Error(`服务器 "${definition.name}" 已存在：请换一个名称，或直接编辑该服务器`)
+      }
+      return [...current, definition]
+    })
   }
 
   /**
@@ -488,11 +568,11 @@ export class McpManager extends Service {
    * @returns the write receipt.
    */
   async update(serverName, input) {
-    const current = this.definitions.find((server) => server.name === serverName)
-    if (current === undefined) throw new Error(`没有名为 "${serverName}" 的服务器`)
-    const definition = normalizeServer(isRecord(input) && input.name === undefined ? { ...input, name: serverName } : input)
-    const next = this.definitions.map((server) => (server.name === serverName ? definition : server))
-    return this.commit(next)
+    return this.queueMutation((current) => {
+      if (!current.some((server) => server.name === serverName)) throw new Error(`没有名为 "${serverName}" 的服务器`)
+      const definition = normalizeServer(isRecord(input) && input.name === undefined ? { ...input, name: serverName } : input)
+      return current.map((server) => (server.name === serverName ? definition : server))
+    })
   }
 
   /**
@@ -501,8 +581,10 @@ export class McpManager extends Service {
    * @returns the write receipt.
    */
   async remove(serverName) {
-    if (!this.definitions.some((server) => server.name === serverName)) throw new Error(`没有名为 "${serverName}" 的服务器`)
-    return this.commit(this.definitions.filter((server) => server.name !== serverName))
+    return this.queueMutation((current) => {
+      if (!current.some((server) => server.name === serverName)) throw new Error(`没有名为 "${serverName}" 的服务器`)
+      return current.filter((server) => server.name !== serverName)
+    })
   }
 
   /**
@@ -512,9 +594,10 @@ export class McpManager extends Service {
    * @returns the write receipt.
    */
   async setEnabled(serverName, enabled) {
-    if (!this.definitions.some((server) => server.name === serverName)) throw new Error(`没有名为 "${serverName}" 的服务器`)
-    const next = this.definitions.map((server) => (server.name === serverName ? { ...server, enabled: enabled !== false } : server))
-    return this.commit(next)
+    return this.queueMutation((current) => {
+      if (!current.some((server) => server.name === serverName)) throw new Error(`没有名为 "${serverName}" 的服务器`)
+      return current.map((server) => (server.name === serverName ? { ...server, enabled: enabled !== false } : server))
+    })
   }
 
   /**
@@ -522,19 +605,23 @@ export class McpManager extends Service {
    *
    * On a server that is down this also revives it: the supervisor starts a
    * fresh connection, which is how the settings page pulls a server out of
-   * "gave up reconnecting" without a config change.
+   * "gave up reconnecting" without a config change. Servers are refreshed
+   * concurrently so one unreachable server's bounded connect timeout does not
+   * become the sum of every server's timeout; a disabled server is skipped
+   * (its supervisor would otherwise connect while the page says "已禁用").
+   *
    * @param serverName - optional single server.
    * @returns the refreshed snapshot.
    */
   async refresh(serverName) {
-    for (const supervisor of this.supervisors.values()) {
-      if (serverName !== undefined && serverName !== '' && supervisor.name !== serverName) continue
-      try {
-        await supervisor.refreshTools()
-      } catch (error) {
-        this.ctx.logger.warn('mcp-manager(%s): tool refresh failed: %s', supervisor.name, errorMessage(error))
-      }
-    }
+    const targets = [...this.supervisors.values()].filter(
+      (supervisor) => (serverName === undefined || serverName === '' || supervisor.name === serverName) && supervisor.enabled,
+    )
+    const results = await Promise.allSettled(targets.map((supervisor) => supervisor.refreshTools()))
+    results.forEach((result, index) => {
+      if (result.status !== 'rejected') return
+      this.ctx.logger.warn('mcp-manager(%s): tool refresh failed: %s', targets[index].name, errorMessage(result.reason))
+    })
     return this.list()
   }
 
@@ -545,7 +632,7 @@ export class McpManager extends Service {
    */
   async probe(input) {
     const definition = normalizeServer(input)
-    const tools = await probeServer(definition)
+    const tools = await probeServer(definition, { logger: this.ctx.logger })
     return { name: definition.name, toolCount: tools.length, tools }
   }
 
@@ -566,29 +653,56 @@ export class McpManager extends Service {
     const args = isRecord(payload) ? payload : {}
     switch (endpoint) {
       case 'state':
-        return this.list()
+        return this.list({ includeTools: args.includeTools !== false })
       case 'add':
-        return this.add(args.definition ?? args)
+        return this.add(definitionFromPayload(args))
       case 'update':
-        return this.update(String(args.name ?? ''), args.definition ?? args)
+        return this.update(serverNameFromPayload(args), definitionFromPayload(args))
       case 'remove':
-        return this.remove(String(args.name ?? ''))
+        return this.remove(serverNameFromPayload(args))
       case 'setEnabled':
-        return this.setEnabled(String(args.name ?? ''), args.enabled !== false)
+        return this.setEnabled(serverNameFromPayload(args), args.enabled !== false)
       case 'start':
-        return this.setEnabled(String(args.name ?? ''), true)
+        return this.setEnabled(serverNameFromPayload(args), true)
       case 'stop':
-        return this.setEnabled(String(args.name ?? ''), false)
+        return this.setEnabled(serverNameFromPayload(args), false)
       case 'refresh':
-        return this.refresh(typeof args.name === 'string' ? args.name : undefined)
+        return this.refresh(typeof args.name === 'string' && args.name !== '' ? args.name : undefined)
       case 'tools':
-        return this.tools(typeof args.name === 'string' ? args.name : undefined)
+        return this.tools(typeof args.name === 'string' && args.name !== '' ? args.name : undefined)
       case 'probe':
-        return this.probe(args.definition ?? args)
+        return this.probe(definitionFromPayload(args))
       default:
         throw new Error(`未知的接口 ${JSON.stringify(endpoint)}`)
     }
   }
+}
+
+/**
+ * Read the one server definition out of an RPC payload.
+ *
+ * Two shapes are accepted so the documented `{ definition }` envelope and the
+ * flat form both keep working; a missing one is reported as such instead of
+ * surfacing as `服务器名称 "" 无效`.
+ * @param payload - decoded RPC payload.
+ * @returns the untrusted definition value.
+ */
+function definitionFromPayload(payload) {
+  const definition = payload.definition ?? payload
+  if (!isRecord(definition)) throw new Error('请求缺少服务器定义（definition）')
+  return definition
+}
+
+/**
+ * Read the server name out of an RPC payload.
+ * @param payload - decoded RPC payload.
+ * @returns the server name.
+ * @throws when the payload carries no usable name.
+ */
+function serverNameFromPayload(payload) {
+  const serverName = payload.name
+  if (typeof serverName !== 'string' || serverName.trim() === '') throw new Error('请求缺少服务器名称（name）')
+  return serverName
 }
 
 /**

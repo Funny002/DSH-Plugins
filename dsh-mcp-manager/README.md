@@ -12,16 +12,19 @@ dsh-mcp-manager/
 ├── cordis.patch.yml       # bundle 自带的组合层：插入 mcp-manager 行
 ├── lib/
 │   ├── index.js           # Host 入口：McpManager（Service）、配置 schema、行挂载模式判定
-│   ├── supervisor.js      # 每个服务器一条受监督连接：世代、退避重连、工具注册/注销、状态
+│   ├── supervisor.js      # 每个服务器一条受监督连接：世代、退避重连、工具注册/注销、过滤、指标
 │   ├── channel.js         # 浏览器 RPC 通道（复用 Connection 的 unary envelope + 信任栅栏）
 │   ├── patch-file.js      # cordis.patch.yml 受管区块的读写（insert / override 两种形态）
 │   ├── naming.js          # mcp__<server>__<tool> 命名契约与内容投影
+│   ├── version.js         # 从 package.json 读版本（Host 握手与设置页徽标共用一份）
 │   └── client.js          # 浏览器半侧：settings.section 页面（lazy-CJS factory 产物）
 └── test/
     ├── mcp-echo-server.mjs  # 本地 MCP 服务器 fixture（stdio 与 --http 两种传输）
-    ├── check-host.mjs       # 离线：配置、重连策略、输出 schema、命名、投影、patch 区块
+    ├── check-host.mjs       # 离线：配置、重连策略、连接超时、工具过滤、命名、投影、patch 区块
     ├── check-channel.mjs    # 离线：RPC envelope、错误分支、体积上限
     ├── check-client.mjs     # 离线：bundle 注册、文案完整性、组件可渲染、展示层断言
+    ├── check-e2e.mjs        # 端到端：真实 stdio fixture 的连接/调用/断线重连/超时/过滤/指标
+    ├── bench-bridge.mjs     # 基准：连接耗时、调用延迟、同步抖动、状态快照体积
     ├── preview-panel.mjs    # 离线：把面板渲染成静态 HTML，便于截图检查排版
     └── verify-live.mjs      # 活体：对运行中的宿主验证重连、预算耗尽、持久化模式
 ```
@@ -69,22 +72,30 @@ config:
 | `transport` | 两种 | 必填 | `stdio` 或 `streamable-http` |
 | `command` / `args` / `cwd` | stdio | — | 可执行文件、参数、工作目录 |
 | `env` | stdio | `{}` | 覆盖式附加环境变量，见下 |
-| `url` / `headers` | streamable-http | — | MCP 端点与附加请求头 |
+| `url` / `headers` | streamable-http | — | MCP 端点（http/https）与附加请求头 |
 | `toolCallTimeoutMs` | 两种 | `60000` | 单次 `tools/call` 超时 |
+| `connectTimeoutMs` | 两种 | `30000` | 单次连接（启动传输 + `initialize`）超时；**必须有界**，否则无响应的服务器会一直挂着清理流程 |
+| `toolFilter.allow` | 两种 | `[]` | 只暴露匹配的工具；空表示全部。按服务器**原始**工具名匹配，`*` 任意串、`?` 单字符 |
+| `toolFilter.deny` | 两种 | `[]` | 隐藏匹配的工具，优先于 `allow` |
 | `reconnect.enabled` | 两种 | `true` | 连接丢失后自动重连 |
 | `reconnect.initialDelayMs` / `maxDelayMs` | 两种 | `500` / `30000` | 指数退避的起止延迟（毫秒） |
 | `reconnect.maxAttempts` | 两种 | `10` | 一次断线内允许的连续失败次数 |
 
 `env` 的值写成 `env.NAME` 或 `${NAME}` 时，在连接那一刻从进程环境读取（含 `$DSH_HOME/.env`），因此凭据不必落在 patch 文件里。stdio 子进程继承的宿主环境会先剔除名字形如 `/KEY|PASSWORD|SECRET|TOKEN/i` 以及全部 `DSH_*` 的变量，再由 `env` 覆盖。
 
+`toolFilter` 是给「一个服务器公布了几十个工具，但只想给模型其中几个」准备的：`allow: ["read_*", "list_?"]` 只暴露只读工具，`deny: ["delete_*"]` 再把危险工具挡掉。卡片上会显示被过滤的数量，详情里能看到生效的规则。改过滤规则等于改定义，会让该服务器重连一次。
+
 ## 运行机制
 
 **连接监督**（`lib/supervisor.js`）
 
 1. 每个服务器由一条**受监督连接**表示，一次连接是一个世代（generation）：一个 `Client` 绑定一个 transport，生命周期内不换。世代关闭（`onclose`）或连接失败后，进入**有界指数退避重连**，延迟 `initialDelayMs × 2^(n-1)`、上限 `maxDelayMs`，一次断线内共享 `maxAttempts` 预算。
-2. **停机期间工具仍然列出。** 断线只让调用失败（错误里带当前状态与重试次数），模型不会突然失去工具；重连成功后自动重新拉取工具列表。连接稳定超过 `maxDelayMs` 会关闭本次断线、重置预算，因此「频繁短暂成功」的崩溃循环仍会耗尽预算而不是无限重试。
-3. **预算耗尽**后注销该服务器的工具并停止重连，状态变为 `error`，错误提示指向重载插件或重启 Host；设置页的「刷新」会重新发起连接，不必改配置。
-4. **`notifications/tools/list_changed`** 会自动触发重新同步；初始同步、通知同步与手动刷新共用一条串行链，避免两次「注销旧世代 / 注册新世代」交错。取列表失败保留上一代工具；注册冲突（别的插件占了 `mcp__<名称>__` 命名空间）只让本服务器贡献零个工具并记录日志，不影响同一行里其他服务器。
+2. **每次尝试都有界。** `connectTimeoutMs` 覆盖传输启动与 `initialize` 握手，`tools/list` 每页 30 秒超时：没有这个上界，一个「进程起来了但永远不回答」的服务器会把连接、同步链、`stop()` 和插件卸载一起挂住。stdio 子进程的 stderr 以管道接入并**限流**转发到宿主日志（每世代最多 20 行 / 16 KiB，之后继续排空但不再记录），既不刷爆宿主输出，也不会因为管道写满而卡住子进程。
+3. **停机期间工具仍然列出。** 断线只让调用失败（错误里带当前状态与重试次数），模型不会突然失去工具；重连成功后自动重新拉取工具列表。连接稳定超过 `maxDelayMs` 会关闭本次断线、重置预算，因此「频繁短暂成功」的崩溃循环仍会耗尽预算而不是无限重试。
+4. **预算耗尽**后注销该服务器的工具并停止重连，状态变为 `error`，错误提示指向重载插件或重启 Host；提示里保留最后一次真实原因（spawn 失败、ECONNREFUSED、握手超时）。设置页的「刷新」会重新发起连接，不必改配置。
+5. **`notifications/tools/list_changed`** 会自动触发重新同步；初始同步、通知同步与手动刷新共用一条串行链，避免两次「注销旧世代 / 注册新世代」交错。通知风暴会被**合并**：同一世代里排队中的通知同步共享一次 `tools/list`。取到的工具列表与当前注册**逐字段相同时不重注册**（避免无意义的注册表 churn）；取列表失败保留上一代工具；注册冲突（别的插件占了 `mcp__<名称>__` 命名空间）只让本服务器贡献零个工具并记录日志，不影响同一行里其他服务器。
+6. **HTTP 会话会真正结束。** SDK 的 `close()` 只中止本地请求，不发 `DELETE`；这里在关闭前先 best-effort `terminateSession()`（2 秒上限），否则每次重连/卸载都会在远端留下一个会话。
+7. **禁用的服务器不会因为「刷新」而连上。** `start()` / `refreshTools()` 对 `enabled: false` 直接返回；只有启用语义的变更才会重新连接。
 
 **工具定义与结果保真**（`lib/naming.js` + `lib/supervisor.js`）
 
@@ -96,23 +107,27 @@ config:
 **Host 半侧**（`lib/index.js`）
 
 1. 为每个启用的定义建立 `McpServerSupervisor`；提供 `mcpManager` 服务（Cordis Service，随 fiber 自动注销）：`list()`、`tools()`、`add()`、`update()`、`remove()`、`setEnabled()`、`refresh()`、`probe()`、`dispatch()`。
-2. 在 `ctx.inject(['connection','webServer'], …)` 里注册 `/mcp-manager` 前缀路由：先跑 Connection 的 Host/Origin + 浏览器 cookie 校验（未认证返回 401/403），再解析 Connection 的 unary envelope 并转发给 `dispatch()`。
-3. 每次变更先写 patch 区块（写入前回读校验模式与服务器列表，写坏就拒绝落盘），再把变更应用到当前 generation 的 supervisor —— 因此在 live 重载到达之前，启停和工具注册/注销就已经生效。
+2. 在 `ctx.inject(['connection','webServer'], …)` 里注册 `/mcp-manager` 前缀路由：先跑 Connection 的 Host/Origin + 浏览器 cookie 校验（未认证返回 401/403），再解析 Connection 的 unary envelope 并转发给 `dispatch()`。任何传输层异常都会变成响应（500），不会留下悬空的 Promise。
+3. 每次变更先写 patch 区块（写入前回读校验模式与服务器列表，写坏就拒绝落盘），再把变更应用到当前 generation 的 supervisor —— 因此在 live 重载到达之前，启停和工具注册/注销就已经生效。变更按**一条串行链**执行（计划 → 落盘 → 运行时替换），所以两个并发的设置页操作不会用陈旧的定义列表互相覆盖，也不会重复 dispose 同一个 supervisor。
+4. 写文件用「pid+时间戳唯一临时文件 → fsync → rename」，并保留原文件的换行风格（CRLF）与权限位：一次保存只改受管区块，不会把整份 patch 文件变成 LF 全量 diff，崩溃也不会留下空文件。
 
 **Browser 半侧**（`lib/client.js`）
 
 - 一个 lazy-CJS factory 产物，通过 `window.__ModuleLoader__.load({ id: 'dsh-mcp-manager', factory })` 注册，只 `require('react')`（平台基线模块），因此不需要构建步骤。
 - 在 `settings.section` 注册 id 为 `mcp-servers` 的设置页（order 25）。**展示要点**：
-  - 标题右侧是**版本徽标**（`v0.2.0`）：版本号由宿主从本包 `package.json` 读取后随 `state` 快照下发，因此页面上显示的永远是实际加载的那份代码的版本；读不到时（或旧宿主）不渲染徽标，而不是显示一个假的 `v`。
+  - 标题右侧是**版本徽标**（`v0.3.0`）：版本号由宿主从本包 `package.json` 读取后随 `state` 快照下发，因此页面上显示的永远是实际加载的那份代码的版本；读不到时（或旧宿主）不渲染徽标，而不是显示一个假的 `v`。
   - 顶部汇总：服务器 / 已启用 / 已连接 / 工具数，有服务器正在重连时额外显示「重连 n」。
-  - 每张卡片头部：名称、传输方式、状态徽标；重连中额外显示「2/5 · 1.8 秒后重试」，并按秒倒计时（只在有服务器重连时启用 1 秒 tick，其余时间跟随 8 秒状态轮询）。操作按钮成组靠右，窄面板下整组换行而不是从中间断开。
+  - 每张卡片头部：名称、传输方式、状态徽标；重连中额外显示「2/5 · 1.8 秒后重试」，并按秒倒计时（只在有服务器重连时启用 1 秒 tick，其余时间跟随 8 秒状态轮询）。有工具被过滤时显示「已过滤 n」。操作按钮成组靠右，窄面板下整组换行而不是从中间断开。
   - **默认折叠，按需展开**：卡片只显示身份行、单行目标（超长省略）、错误（若有）和一行入口「详情 / 工具列表 (n)」，把每张卡片的阅读量压到 3 行左右。两个入口互相独立，展开状态由设置页记住，状态轮询不会把它们收起来。
-  - 「详情」展开**信息栅格**：目标完整值（stdio 命令行或 URL）、单次调用超时、重连策略（关闭 / `最多 10 次 · 500ms → 30s`），已连接时再加「已连接」「最近同步」的相对时间，重连中再加「下次重试」。
+  - 「详情」展开**信息栅格**：目标完整值（stdio 命令行或 URL）、单次调用超时、连接超时、重连策略（关闭 / `最多 10 次 · 500ms → 30s`）、**调用指标**（`12 次 · 平均 30ms · 失败 1`，有失败才显示失败数）与累计重连次数；已连接时再加「已连接」「最近同步」的相对时间，重连中再加「下次重试」。指标从插件加载或该定义被修改时开始累计。
   - 错误以「最近错误」标签 + 原文显示，折叠态也始终可见（最多两行，完整文本在 `title` 里）。
   - 「工具列表 (n)」始终显示工具数（0 也可展开，得到「该服务器还没有公布工具」）；展开后可筛选（超过 6 个工具时出现搜索框），每行显示公开名、与公开名不同的原始 MCP 名、描述，并可一键复制公开名；列表最高 340px，超出滚动。
   - 操作反馈（已保存 / 已刷新 / 已启用…）以横幅显示，**4.5 秒后自动消失**；执行新操作或打开编辑表单会立即清掉它，卸载时也会取消挂起的定时器。失败提示不自动消失，但会在下一次状态轮询成功时清空。
+  - **状态轮询只取轻量快照**：8 秒一次的 `state` 请求带 `includeTools: false`，工具行（每条都带描述）不再随着每次轮询传输；页面用本地缓存的行渲染已展开的卡片，只有某台服务器的 `toolCount` / `lastSyncAt` 变了才补一次完整快照。200 个工具时单次轮询从约 21 KB 降到 0.8 KB。
   - 页脚只保留一行「配置文件: `<绝对路径>`」；该行由 bundle 提供还是由区块插入，改成这一行的 `title` 提示，不再占版面。
-- 支持启用/停用、编辑、删除、刷新、展开工具列表、「测试连接」（`probe`，不注册任何工具）。
+- 编辑表单除命令/参数/环境/地址/超时外，还有**连接超时**与两行**工具过滤**（允许 / 拒绝，每行一个，支持 `*` 与 `?`）。
+- 支持启用/停用、编辑、删除、刷新、展开工具列表、「测试连接」（`probe`，不注册任何工具；握手与取列表同样受 `connectTimeoutMs` 约束）。
+
 - **页面文案固定中文**：`lib/client.js` 顶部的 `PAGE_LOCALE = "zh"` 决定页面语言，与 GUI 语言无关；改成 `"auto"` 即恢复跟随 locale 服务。zh/en 两份字典仍会注册到 `mcp-manager` 命名空间。
 - 每次变更后会轮询 `state` 直到 `generation` 变化，以此确认「已写入配置文件并热重载」。
 
@@ -120,14 +135,16 @@ config:
 
 | endpoint | 载荷 | 返回 |
 | --- | --- | --- |
-| `state` | `{}` | `{ generation, version, rowId, patchMode, channel, patchFile, persistence, servers[], totals }` |
+| `state` | `{ includeTools?: boolean }` | `{ generation, version, rowId, patchMode, channel, patchFile, persistence, toolsIncluded, servers[], totals }`；`includeTools: false` 时每台服务器省略 `tools`（`toolCount` 仍保留） |
 | `add` | `{ definition }` | 写入回执 + `snapshot` |
 | `update` | `{ name, definition }` | 写入回执 + `snapshot`（改 `definition.name` 即重命名） |
 | `remove` | `{ name }` | 写入回执 + `snapshot` |
 | `setEnabled` / `start` / `stop` | `{ name, enabled? }` | 写入回执 + `snapshot` |
-| `refresh` | `{ name? }` | 重新拉取工具列表后的 `snapshot`（服务器断开时同时恢复连接） |
+| `refresh` | `{ name? }` | 重新拉取工具列表后的 `snapshot`（服务器断开时同时恢复连接；禁用的服务器跳过；多台服务器并发刷新） |
 | `tools` | `{ name? }` | `{ tools: [{ server, rawName, publicName, description }] }` |
 | `probe` | `{ definition }` | `{ name, toolCount, tools }`，不持久化、不注册工具 |
+
+每个 `servers[]` 条目除 `definition / state / error / toolCount / startedAt / lastSyncAt / timeoutMs / reconnect` 外，还带 `connectTimeoutMs`、`toolFilter`、`filteredToolCount` 与 `metrics: { calls, errors, avgMs, lastCallMs, lastCallAt, reconnects }`。新增字段都是增量，旧页面对新宿主、新页面对旧宿主都能工作（旧宿主没有 `toolsIncluded` 时页面按完整快照处理）。
 
 业务失败以 `200` + `{ ok: false, error }` 返回（浏览器半侧折叠成错误提示）；只有传输层问题用非 200。
 
@@ -136,11 +153,17 @@ config:
 离线（在 checkout 里 `pnpm install` 之后，无需 Harness）：
 
 ```sh
-node test/check-host.mjs      # 配置、重连策略、输出 schema、命名、投影、patch 区块两种形态
+node test/check-host.mjs      # 配置、重连策略、连接超时、工具过滤、输出 schema、命名、投影、patch 区块两种形态
 node test/check-channel.mjs   # RPC envelope、401/404/413/415/400 分支
-node test/check-client.mjs    # bundle 注册、70 条文案完整性、组件结构与展示层断言
+node test/check-client.mjs    # bundle 注册、78 条文案完整性、组件结构与展示层断言、轮询合并
+node test/check-e2e.mjs       # 真实 fixture：stdio 连接/调用、断线重连后工具仍在、握手超时不残留子进程、
+                              #   stderr 限流、工具过滤、禁用不连接、调用指标、分页上限，
+                              #   以及 Streamable-HTTP 的连接、调用与卸载时的 DELETE 会话终止
+node test/bench-bridge.mjs    # 基准（只报告不判定），可加 --expose-gc 看堆
 node test/preview-panel.mjs panel-preview.html   # 渲染静态面板（可再用无头浏览器截图检查排版）
 ```
+
+`check-host.mjs` 需要 `@deepseek-ai/cordis` 与 `@deepseek-ai/schemastery`（`devDependencies`）；`check-e2e.mjs` / `bench-bridge.mjs` 只用运行期依赖，允许在宿主全局 `node_modules` 里跑。
 
 活体验证（需要一个运行中的宿主；`verify-live.mjs` 用启动时打印的 `--token` 换取 cookie）：
 
@@ -162,7 +185,9 @@ node test/verify-live.mjs http://127.0.0.1:3080 <token-from-launch-line>
 ## 已知限制
 
 - **只桥接工具。** MCP resources 与 prompts 没有消费方，不注册（内嵌资源在结果里降级为占位文本）。
-- **整行热替换。** 每次持久化都会改变本行的 config，profile 的 live patch 因此重挂本行：所有服务器会重连一次、工具短暂注销后重新注册。会话历史与权限规则不受影响，因为公开工具名只由 `(serverName, rawName)` 决定。若只想让单个服务器重连，用「刷新」或启停该服务器。
+- **整行热替换。** 每次持久化都会改变本行的 config，profile 的 live patch 因此重挂本行：所有服务器会重连一次、工具短暂注销后重新注册，**调用指标也随之清零**（指标属于一条受监督连接，不跨定义变更累计）。会话历史与权限规则不受影响，因为公开工具名只由 `(serverName, rawName)` 决定。若只想让单个服务器重连，用「刷新」或启停该服务器。
+- **过滤器匹配原始工具名。** `toolFilter` 看的是服务器自己公布的名字（不是 `mcp__<server>__` 公开名），所以给服务器改名不需要改过滤规则；规则里没有正则，只有 `*` / `?` 两个通配符。
+- **HTTP 会话终止是 best-effort。** 服务器可以拒绝或忽略 `DELETE`（2 秒上限），此时只在远端留下一个空会话，不影响本地重连。
 - **图片依赖模型路由。** 只有活动模型声明图片输入、且附件存储接受该媒体类型时图片才进入上下文；否则降级为说明文本。
 - **凭据可落在 patch 文件里。** 用 `env.NAME` / `${NAME}` 间接引用进程环境即可避免；注意 patch 文件本身没有权限保护。
 - **启动期异步。** 服务器连接不阻塞 profile 启动，因此会话开始后一瞬间工具可能尚未出现；等待或点「刷新」即可。
@@ -173,3 +198,6 @@ node test/verify-live.mjs http://127.0.0.1:3080 <token-from-launch-line>
 - 以 `link:` 安装时宿主与 checkout 各有一份 `@deepseek-ai/cordis`；两者版本应保持一致（本仓库 `devDependencies` 固定为当前部署版本），避免跨版本的服务实现漂移。
 - `lib/index.js` 是 loader 直接 import 的模块；Node 按 URL 缓存 ESM，所以在**同一个进程里**改代码后必须重启 profile 才会加载新代码。
 - 受管区块由设置页重写；想手工固定模块定位，可以把 `override` 区块换成 `insert` 形态并写明 `name:`，或直接在 `cordis.patch.yml` 里加自己的行（注意不要与 bundle 层重复）。
+- 首次运行 `npx` 类服务器时冷启动可能超过默认的 30 秒连接超时：把该服务器的 `connectTimeoutMs` 调到 `120000` 左右，而不是关掉重连。超时信息会写进卡片的「最近错误」。
+- 性能基线（`node test/bench-bridge.mjs`，Windows 11 / Node 26，202 个工具）：连接约 0.3 秒，工具调用往返 p50 约 0.4 毫秒，200 工具的完整状态快照约 21 KB、轻量轮询快照约 0.8 KB；空转 10 次「连接→注销」不增长句柄。
+
